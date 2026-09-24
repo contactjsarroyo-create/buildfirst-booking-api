@@ -1,10 +1,23 @@
 import { sql } from '@vercel/postgres';
+import jwt from 'jsonwebtoken';
+
+function getTenantIdFromAuth(req) {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return null;
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    return payload.tenant_id;
+  } catch {
+    return null;
+  }
+}
 
 export default async function handler(req, res) {
   if (req.method === 'GET') {
-    const { tenant_id } = req.query;
+    const tenant_id = getTenantIdFromAuth(req);
     if (!tenant_id) {
-      return res.status(400).json({ ok: false, error: 'tenant_id is required' });
+      return res.status(401).json({ ok: false, error: 'Missing or invalid authorization token' });
     }
     try {
       const result = await sql`
@@ -17,6 +30,8 @@ export default async function handler(req, res) {
   }
 
   if (req.method === 'POST') {
+    // POST stays open with no login required — this is the public guest-facing
+    // booking widget, not the dashboard. tenant_id comes from the widget's embed config.
     const {
       tenant_id,
       unit_type_id,
@@ -26,8 +41,8 @@ export default async function handler(req, res) {
       check_in,
       check_out,
       guests,
-      addon_ids,      // optional array of addon uuids, e.g. ["uuid1", "uuid2"]
-      promo_code,      // optional string, e.g. "SUMMER2026"
+      addon_ids,
+      promo_code,
     } = req.body || {};
 
     if (!tenant_id || !unit_type_id || !guest_name || !guest_email || !check_in || !check_out) {
@@ -38,7 +53,6 @@ export default async function handler(req, res) {
     }
 
     try {
-      // --- Unit type + rate ---
       const unitTypeResult = await sql`
         SELECT base_rate, unit_count FROM unit_types
         WHERE id = ${unit_type_id} AND tenant_id = ${tenant_id}
@@ -56,7 +70,6 @@ export default async function handler(req, res) {
         return res.status(400).json({ ok: false, error: 'check_out must be after check_in' });
       }
 
-      // --- Availability check ---
       const overlappingBookings = await sql`
         SELECT COUNT(*) FROM bookings
         WHERE unit_type_id = ${unit_type_id}
@@ -79,9 +92,8 @@ export default async function handler(req, res) {
         return res.status(409).json({ ok: false, error: 'No rooms of this type are available for the selected dates' });
       }
 
-      // --- Addons ---
       let addonsAmount = 0;
-      const validAddons = []; // { id, price }
+      const validAddons = [];
       if (Array.isArray(addon_ids) && addon_ids.length > 0) {
         const addonsResult = await sql`
           SELECT id, price FROM addons
@@ -100,7 +112,6 @@ export default async function handler(req, res) {
       const baseAmount = baseRate * nights;
       const preDiscountSubtotal = baseAmount + addonsAmount;
 
-      // --- Promo code ---
       let discountAmount = 0;
       let promoCodeId = null;
       if (promo_code) {
@@ -136,20 +147,17 @@ export default async function handler(req, res) {
         promoCodeId = promo.id;
       }
 
-      // --- VAT (applied after discount) ---
       const settingsResult = await sql`
         SELECT vat_percent FROM tenant_settings WHERE tenant_id = ${tenant_id}
       `;
       const vatPercent = settingsResult.rows.length > 0
         ? Number(settingsResult.rows[0].vat_percent)
-        : 12.00; // fallback matches schema default
+        : 12.00;
 
       const taxableAmount = preDiscountSubtotal - discountAmount;
       const vatAmount = taxableAmount * (vatPercent / 100);
-
       const totalAmount = taxableAmount + vatAmount;
 
-      // --- Insert booking ---
       const result = await sql`
         INSERT INTO bookings (
           tenant_id, unit_type_id, guest_name, guest_email, guest_phone,
@@ -165,7 +173,6 @@ export default async function handler(req, res) {
       `;
       const booking = result.rows[0];
 
-      // --- Insert booking_addons rows ---
       for (const addon of validAddons) {
         await sql`
           INSERT INTO booking_addons (booking_id, addon_id, quantity, price_at_booking)
@@ -173,7 +180,6 @@ export default async function handler(req, res) {
         `;
       }
 
-      // --- Increment promo code usage ---
       if (promoCodeId) {
         await sql`
           UPDATE promo_codes SET times_used = times_used + 1 WHERE id = ${promoCodeId}
