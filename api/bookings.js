@@ -36,9 +36,9 @@ export default async function handler(req, res) {
     }
 
     try {
-      // Look up the unit type's base rate (server-side, never trust a client-sent price)
+      // Look up the unit type's base rate and how many physical units exist
       const unitTypeResult = await sql`
-        SELECT base_rate FROM unit_types
+        SELECT base_rate, unit_count FROM unit_types
         WHERE id = ${unit_type_id} AND tenant_id = ${tenant_id}
       `;
 
@@ -47,12 +47,51 @@ export default async function handler(req, res) {
       }
 
       const baseRate = Number(unitTypeResult.rows[0].base_rate);
+      const unitCount = Number(unitTypeResult.rows[0].unit_count);
+
       const nights = Math.ceil(
         (new Date(check_out) - new Date(check_in)) / (1000 * 60 * 60 * 24)
       );
 
       if (nights <= 0) {
         return res.status(400).json({ ok: false, error: 'check_out must be after check_in' });
+      }
+
+      // Count existing confirmed bookings for this unit type that overlap the requested dates.
+      // Overlap rule: existing.check_in < new.check_out AND existing.check_out > new.check_in
+      const overlappingBookings = await sql`
+        SELECT COUNT(*) FROM bookings
+        WHERE unit_type_id = ${unit_type_id}
+          AND tenant_id = ${tenant_id}
+          AND status = 'confirmed'
+          AND check_in < ${check_out}
+          AND check_out > ${check_in}
+      `;
+
+      // Count any manual/OTA availability blocks that overlap the requested dates
+      const overlappingBlocks = await sql`
+        SELECT COUNT(*) FROM availability_blocks
+        WHERE unit_type_id = ${unit_type_id}
+          AND tenant_id = ${tenant_id}
+          AND start_date < ${check_out}
+          AND end_date > ${check_in}
+      `;
+
+      const bookedCount = Number(overlappingBookings.rows[0].count);
+      const blockedCount = Number(overlappingBlocks.rows[0].count);
+
+      if (blockedCount > 0) {
+        return res.status(409).json({
+          ok: false,
+          error: 'These dates are blocked for this room type',
+        });
+      }
+
+      if (bookedCount >= unitCount) {
+        return res.status(409).json({
+          ok: false,
+          error: 'No rooms of this type are available for the selected dates',
+        });
       }
 
       const baseAmount = baseRate * nights;
