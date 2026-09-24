@@ -1,0 +1,24 @@
+{
+  "name": "buildfirst-booking-api",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/contactjsarroyo-create/buildfirst-booking-api.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/contactjsarroyo-create/buildfirst-booking-api/issues"
+  },
+  "homepage": "https://github.com/contactjsarroyo-create/buildfirst-booking-api#readme",
+  "dependencies": {
+    "@vercel/postgres": "^0.10.0"
+  }
+}
