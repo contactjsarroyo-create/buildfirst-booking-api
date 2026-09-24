@@ -1,6 +1,48 @@
 import { sql } from '@vercel/postgres';
 import { setCors, getAuth, num, text } from './_lib/helpers.js';
 
+const HEX_RE = /^#[0-9a-fA-F]{6}$/;
+const FONT_WHITELIST = [
+  'Inter',
+  'Poppins',
+  'Playfair Display',
+  'Montserrat',
+  'Lora',
+  'Work Sans',
+  'DM Sans',
+  'Cormorant Garamond',
+];
+const MODE_WHITELIST = ['light', 'dark', 'auto'];
+
+// Validates an incoming theme object and returns a clean version with only
+// known keys, or null if the input isn't a usable object at all.
+// Invalid individual fields are dropped rather than failing the whole request,
+// except mode/font/radius which fall back to a sane default if invalid.
+function sanitizeTheme(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
+
+  const out = {};
+
+  out.mode = MODE_WHITELIST.includes(input.mode) ? input.mode : 'auto';
+
+  const colorFields = ['background', 'surface', 'text', 'muted_text', 'border'];
+  for (const field of colorFields) {
+    const v = input[field];
+    if (typeof v === 'string' && HEX_RE.test(v)) {
+      out[field] = v;
+    } else {
+      out[field] = null;
+    }
+  }
+
+  out.font = FONT_WHITELIST.includes(input.font) ? input.font : 'Inter';
+
+  const radiusNum = num(input.radius);
+  out.radius = radiusNum === null ? 8 : Math.min(24, Math.max(0, Math.round(radiusNum)));
+
+  return out;
+}
+
 export default async function handler(req, res) {
   if (setCors(req, res, 'GET, PUT, OPTIONS')) return;
 
@@ -16,7 +58,7 @@ export default async function handler(req, res) {
         select logo_url, primary_color, embed_domain,
                checkin_time::text as checkin_time, checkout_time::text as checkout_time,
                cancellation_policy, deposit_percent, vat_percent,
-               min_stay_nights, booking_window_days
+               min_stay_nights, booking_window_days, theme
         from tenant_settings where tenant_id = ${auth.tenant_id}
       `;
       return res.status(200).json({
@@ -50,18 +92,28 @@ export default async function handler(req, res) {
         await sql`update tenants set name = ${name}, updated_at = now() where id = ${auth.tenant_id}`;
       }
 
-      const existing = await sql`select tenant_id from tenant_settings where tenant_id = ${auth.tenant_id}`;
+      const existing = await sql`select tenant_id, theme from tenant_settings where tenant_id = ${auth.tenant_id}`;
+
+      // Only touch theme if the request actually included a theme key.
+      // Otherwise keep whatever is already saved (existing row's theme, or null for a new row).
+      let themeToSave = existing.rows.length > 0 ? existing.rows[0].theme : null;
+      if (Object.prototype.hasOwnProperty.call(b, 'theme')) {
+        themeToSave = sanitizeTheme(b.theme);
+      }
+      const themeJson = themeToSave === null ? null : JSON.stringify(themeToSave);
 
       if (existing.rows.length === 0) {
         await sql`
           insert into tenant_settings
             (tenant_id, logo_url, primary_color, embed_domain, checkin_time, checkout_time,
-             cancellation_policy, deposit_percent, vat_percent, min_stay_nights, booking_window_days, updated_at)
+             cancellation_policy, deposit_percent, vat_percent, min_stay_nights, booking_window_days,
+             theme, updated_at)
           values
             (${auth.tenant_id}, ${vals.logo_url}, ${vals.primary_color}, ${vals.embed_domain},
              ${vals.checkin_time}::time, ${vals.checkout_time}::time, ${vals.cancellation_policy},
              ${vals.deposit_percent}::numeric, ${vals.vat_percent}::numeric,
-             ${vals.min_stay_nights}::integer, ${vals.booking_window_days}::integer, now())
+             ${vals.min_stay_nights}::integer, ${vals.booking_window_days}::integer,
+             ${themeJson}::jsonb, now())
         `;
       } else {
         await sql`
@@ -76,6 +128,7 @@ export default async function handler(req, res) {
             vat_percent = ${vals.vat_percent}::numeric,
             min_stay_nights = ${vals.min_stay_nights}::integer,
             booking_window_days = ${vals.booking_window_days}::integer,
+            theme = ${themeJson}::jsonb,
             updated_at = now()
           where tenant_id = ${auth.tenant_id}
         `;
