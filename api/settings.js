@@ -43,6 +43,40 @@ function sanitizeTheme(input) {
   return out;
 }
 
+// ------------------------------------------------------------
+// Payment channels: which ways a guest can pay this tenant.
+// "paymongo" has no manual fields (future automatic integration).
+// The others are manually confirmed channels with tenant-provided
+// details shown to the guest at checkout.
+// ------------------------------------------------------------
+const PAYMENT_CHANNEL_KEYS = ['paymongo', 'bank_transfer', 'gcash', 'maya', 'qr_code'];
+
+const CHANNEL_FIELDS = {
+  paymongo: [],
+  bank_transfer: ['bank_name', 'account_name', 'account_number', 'instructions'],
+  gcash: ['account_name', 'number', 'instructions'],
+  maya: ['account_name', 'number', 'instructions'],
+  qr_code: ['image_url', 'label'],
+};
+
+function sanitizePaymentChannels(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
+
+  const out = {};
+  for (const key of PAYMENT_CHANNEL_KEYS) {
+    const ch = input[key];
+    const enabled = !!(ch && ch.enabled === true);
+    out[key] = { enabled };
+
+    const fields = CHANNEL_FIELDS[key] || [];
+    for (const field of fields) {
+      const v = ch && ch[field];
+      out[key][field] = typeof v === 'string' ? v.slice(0, 500) : null;
+    }
+  }
+  return out;
+}
+
 export default async function handler(req, res) {
   if (setCors(req, res, 'GET, PUT, OPTIONS')) return;
 
@@ -58,7 +92,7 @@ export default async function handler(req, res) {
         select logo_url, primary_color, embed_domain,
                checkin_time::text as checkin_time, checkout_time::text as checkout_time,
                cancellation_policy, deposit_percent, vat_percent,
-               min_stay_nights, booking_window_days, theme
+               min_stay_nights, booking_window_days, theme, payment_channels
         from tenant_settings where tenant_id = ${auth.tenant_id}
       `;
       return res.status(200).json({
@@ -92,28 +126,36 @@ export default async function handler(req, res) {
         await sql`update tenants set name = ${name}, updated_at = now() where id = ${auth.tenant_id}`;
       }
 
-      const existing = await sql`select tenant_id, theme from tenant_settings where tenant_id = ${auth.tenant_id}`;
+      const existing = await sql`
+        select tenant_id, theme, payment_channels from tenant_settings where tenant_id = ${auth.tenant_id}
+      `;
 
-      // Only touch theme if the request actually included a theme key.
-      // Otherwise keep whatever is already saved (existing row's theme, or null for a new row).
+      // Only touch theme / payment_channels if the request actually included that key.
+      // Otherwise keep whatever is already saved.
       let themeToSave = existing.rows.length > 0 ? existing.rows[0].theme : null;
       if (Object.prototype.hasOwnProperty.call(b, 'theme')) {
         themeToSave = sanitizeTheme(b.theme);
       }
       const themeJson = themeToSave === null ? null : JSON.stringify(themeToSave);
 
+      let channelsToSave = existing.rows.length > 0 ? existing.rows[0].payment_channels : null;
+      if (Object.prototype.hasOwnProperty.call(b, 'payment_channels')) {
+        channelsToSave = sanitizePaymentChannels(b.payment_channels);
+      }
+      const channelsJson = channelsToSave === null ? null : JSON.stringify(channelsToSave);
+
       if (existing.rows.length === 0) {
         await sql`
           insert into tenant_settings
             (tenant_id, logo_url, primary_color, embed_domain, checkin_time, checkout_time,
              cancellation_policy, deposit_percent, vat_percent, min_stay_nights, booking_window_days,
-             theme, updated_at)
+             theme, payment_channels, updated_at)
           values
             (${auth.tenant_id}, ${vals.logo_url}, ${vals.primary_color}, ${vals.embed_domain},
              ${vals.checkin_time}::time, ${vals.checkout_time}::time, ${vals.cancellation_policy},
              ${vals.deposit_percent}::numeric, ${vals.vat_percent}::numeric,
              ${vals.min_stay_nights}::integer, ${vals.booking_window_days}::integer,
-             ${themeJson}::jsonb, now())
+             ${themeJson}::jsonb, ${channelsJson}::jsonb, now())
         `;
       } else {
         await sql`
@@ -129,6 +171,7 @@ export default async function handler(req, res) {
             min_stay_nights = ${vals.min_stay_nights}::integer,
             booking_window_days = ${vals.booking_window_days}::integer,
             theme = ${themeJson}::jsonb,
+            payment_channels = ${channelsJson}::jsonb,
             updated_at = now()
           where tenant_id = ${auth.tenant_id}
         `;
