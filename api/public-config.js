@@ -1,6 +1,15 @@
 import { sql } from '@vercel/postgres';
 import { setCors, text, isBookableStatus } from './_lib/helpers.js';
 
+// Matches the shape in settings.js's CHANNEL_FIELDS — keep them in sync if either changes.
+const DEFAULT_PAYMENT_CHANNELS = {
+  paymongo: { enabled: false },
+  bank_transfer: { enabled: false, bank_name: null, account_name: null, account_number: null, instructions: null },
+  gcash: { enabled: false, account_name: null, number: null, instructions: null },
+  maya: { enabled: false, account_name: null, number: null, instructions: null },
+  qr_code: { enabled: false, image_url: null, label: null },
+};
+
 export default async function handler(req, res) {
   if (setCors(req, res, 'GET, OPTIONS')) return;
   if (req.method !== 'GET') {
@@ -26,7 +35,7 @@ export default async function handler(req, res) {
       SELECT primary_color, logo_url,
              checkin_time::text AS checkin_time, checkout_time::text AS checkout_time,
              cancellation_policy, vat_percent, min_stay_nights, booking_window_days,
-             theme
+             theme, payment_channels
       FROM tenant_settings WHERE tenant_id = ${tenant.id}
     `;
     const settings = s.rows[0] || {};
@@ -57,6 +66,7 @@ export default async function handler(req, res) {
         min_stay_nights: settings.min_stay_nights || 1,
         booking_window_days: settings.booking_window_days || 365,
         theme: settings.theme || null,
+        payment_channels: settings.payment_channels || DEFAULT_PAYMENT_CHANNELS,
       },
       unit_types: units.rows,
       addons: addons.rows,
