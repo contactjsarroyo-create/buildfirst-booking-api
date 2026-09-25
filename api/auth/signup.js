@@ -64,7 +64,7 @@ export default async function handler(req, res) {
 
     const tenantResult = await sql`
       insert into tenants (slug, name, plan, status, timezone, currency, trial_ends_at, created_at, updated_at)
-      values (${slug}, ${resortName}, ${plan}, 'trial', 'Asia/Manila', 'PHP', ${trialEndsAt.toISOString()}::timestamptz, now(), now())
+      values (${slug}, ${resortName}, ${plan}, 'onboarding', 'Asia/Manila', 'PHP', ${trialEndsAt.toISOString()}::timestamptz, now(), now())
       returning id, slug
     `;
     const tenant = tenantResult.rows[0];
