@@ -33,3 +33,9 @@ export function text(v) {
   const s = String(v).trim();
   return s === '' ? null : s;
 }
+
+// A tenant can take bookings while active, or during their trial.
+// Anything else (suspended, cancelled, etc.) is not bookable.
+export function isBookableStatus(status) {
+  return status === 'active' || status === 'trial';
+}
