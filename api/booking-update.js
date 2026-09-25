@@ -11,17 +11,46 @@ export default async function handler(req, res) {
   if (!auth) return res.status(401).json({ ok: false, error: 'Unauthorized' });
 
   try {
-    const { id, status } = req.body || {};
-    const allowed = ['pending', 'confirmed', 'cancelled'];
-    if (!id || !allowed.includes(status)) {
-      return res.status(400).json({ ok: false, error: 'id and a valid status are required' });
+    const { id, status, mark_paid } = req.body || {};
+    const allowedStatus = ['pending', 'confirmed', 'cancelled'];
+
+    if (!id) {
+      return res.status(400).json({ ok: false, error: 'id is required' });
+    }
+    if (status !== undefined && !allowedStatus.includes(status)) {
+      return res.status(400).json({ ok: false, error: 'status must be one of: ' + allowedStatus.join(', ') });
+    }
+    if (status === undefined && !mark_paid) {
+      return res.status(400).json({ ok: false, error: 'Provide a status and/or mark_paid' });
     }
 
-    const result = await sql`
-      update bookings set status = ${status}
-      where id = ${id} and tenant_id = ${auth.tenant_id}
-      returning id, status
-    `;
+    let result;
+
+    if (status !== undefined && mark_paid) {
+      result = await sql`
+        update bookings set
+          status = ${status},
+          payment_status = 'paid',
+          payment_confirmed_at = now()
+        where id = ${id} and tenant_id = ${auth.tenant_id}
+        returning id, status, payment_status, payment_confirmed_at
+      `;
+    } else if (status !== undefined) {
+      result = await sql`
+        update bookings set status = ${status}
+        where id = ${id} and tenant_id = ${auth.tenant_id}
+        returning id, status, payment_status, payment_confirmed_at
+      `;
+    } else {
+      result = await sql`
+        update bookings set
+          payment_status = 'paid',
+          payment_confirmed_at = now()
+        where id = ${id} and tenant_id = ${auth.tenant_id}
+        returning id, status, payment_status, payment_confirmed_at
+      `;
+    }
+
     if (result.rows.length === 0) {
       return res.status(404).json({ ok: false, error: 'Booking not found' });
     }
