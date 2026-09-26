@@ -69,13 +69,13 @@ export default async function handler(req, res) {
 
       const result = await sql`
         INSERT INTO bookings (
-          tenant_id, unit_type_id, room_id, guest_name, guest_email, guest_phone,
+          tenant_id, unit_type_id, guest_name, guest_email, guest_phone,
           check_in, check_out, guests, special_requests, base_amount, addons_amount,
           vat_amount, discount_amount, total_amount, promo_code_id,
           payment_channel, payment_reference
         )
         VALUES (
-          ${q.tenant_id}, ${q.unit_type_id}, ${q.room_id}, ${guest_name}, ${guest_email}, ${guest_phone},
+          ${q.tenant_id}, ${q.unit_type_id}, ${guest_name}, ${guest_email}, ${guest_phone},
           ${q.check_in}, ${q.check_out}, ${q.guests}, ${special_requests}, ${q.base_amount}, ${q.addons_amount},
           ${q.vat_amount}, ${q.discount_amount}, ${q.total_amount}, ${q.promo_code_id},
           ${payment_channel}, ${payment_reference}
