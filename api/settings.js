@@ -77,6 +77,96 @@ function sanitizePaymentChannels(input) {
   return out;
 }
 
+// ------------------------------------------------------------
+// Custom fields: tenant-defined questions asked on the guest-details
+// step of the booking widget. Stored as an ordered array; each
+// booking stores its answers keyed by `key` in
+// bookings.custom_field_responses.
+// ------------------------------------------------------------
+const CUSTOM_FIELD_TYPES = ['text', 'textarea', 'select', 'checkbox'];
+const CUSTOM_FIELD_KEY_RE = /^[a-z][a-z0-9_]{0,49}$/;
+const MAX_CUSTOM_FIELDS = 20;
+
+// Returns { fields, error }. fields is null if input is fundamentally
+// unusable; error is set (and fields null) if a specific problem should
+// be reported back to the caller rather than silently dropped, since
+// broken custom fields could otherwise silently stop bookings from
+// working (unlike theme/payment_channels which degrade gracefully).
+function sanitizeCustomFields(input) {
+  if (input === null) return { fields: [], error: null };
+  if (!Array.isArray(input)) {
+    return { fields: null, error: 'custom_fields must be an array' };
+  }
+  if (input.length > MAX_CUSTOM_FIELDS) {
+    return { fields: null, error: `custom_fields cannot exceed ${MAX_CUSTOM_FIELDS} entries` };
+  }
+
+  const out = [];
+  const seenKeys = new Set();
+
+  for (let i = 0; i < input.length; i++) {
+    const f = input[i];
+    if (!f || typeof f !== 'object') {
+      return { fields: null, error: `custom_fields[${i}] must be an object` };
+    }
+
+    const key = typeof f.key === 'string' ? f.key.trim().toLowerCase() : '';
+    if (!CUSTOM_FIELD_KEY_RE.test(key)) {
+      return {
+        fields: null,
+        error: `custom_fields[${i}].key must be lowercase letters/numbers/underscores, starting with a letter (got: "${f.key}")`,
+      };
+    }
+    if (seenKeys.has(key)) {
+      return { fields: null, error: `custom_fields has a duplicate key: "${key}"` };
+    }
+    seenKeys.add(key);
+
+    const label = typeof f.label === 'string' ? f.label.trim().slice(0, 200) : '';
+    if (!label) {
+      return { fields: null, error: `custom_fields[${i}] (key: "${key}") needs a label` };
+    }
+
+    const type = CUSTOM_FIELD_TYPES.includes(f.type) ? f.type : null;
+    if (!type) {
+      return {
+        fields: null,
+        error: `custom_fields[${i}] (key: "${key}") type must be one of: ${CUSTOM_FIELD_TYPES.join(', ')}`,
+      };
+    }
+
+    const required = f.required === true;
+
+    const entry = { key, label, type, required };
+
+    if (type === 'select') {
+      const options = Array.isArray(f.options)
+        ? f.options
+            .filter((o) => typeof o === 'string' && o.trim())
+            .map((o) => o.trim().slice(0, 100))
+            .slice(0, 30)
+        : [];
+      if (options.length === 0) {
+        return {
+          fields: null,
+          error: `custom_fields[${i}] (key: "${key}") is type "select" but has no options`,
+        };
+      }
+      entry.options = options;
+    }
+
+    out.push(entry);
+  }
+
+  return { fields: out, error: null };
+}
+
+// ------------------------------------------------------------
+// Widget template + public slug
+// ------------------------------------------------------------
+const WIDGET_TEMPLATE_WHITELIST = ['standard', 'calendar_prices'];
+const PUBLIC_SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/; // lowercase, digits, hyphens; no leading/trailing hyphen
+
 export default async function handler(req, res) {
   if (setCors(req, res, 'GET, PUT, OPTIONS')) return;
 
@@ -86,13 +176,14 @@ export default async function handler(req, res) {
   try {
     if (req.method === 'GET') {
       const t = await sql`
-        select name, slug, plan, currency from tenants where id = ${auth.tenant_id}
+        select name, slug, public_slug, plan, currency from tenants where id = ${auth.tenant_id}
       `;
       const s = await sql`
         select logo_url, primary_color, embed_domain,
                checkin_time::text as checkin_time, checkout_time::text as checkout_time,
                cancellation_policy, deposit_percent, vat_percent,
-               min_stay_nights, booking_window_days, theme, payment_channels
+               min_stay_nights, booking_window_days, theme, payment_channels,
+               custom_fields, widget_template
         from tenant_settings where tenant_id = ${auth.tenant_id}
       `;
       return res.status(200).json({
@@ -122,16 +213,39 @@ export default async function handler(req, res) {
         return res.status(400).json({ ok: false, error: 'Percentages must be between 0 and 100' });
       }
 
+      // ---- public_slug: only touch tenants.public_slug if the request
+      // included the key. Validate format, then try the update and
+      // translate a unique-constraint violation into a friendly 409.
+      if (Object.prototype.hasOwnProperty.call(b, 'public_slug')) {
+        const rawSlug = typeof b.public_slug === 'string' ? b.public_slug.trim().toLowerCase() : '';
+        if (!PUBLIC_SLUG_RE.test(rawSlug)) {
+          return res.status(400).json({
+            ok: false,
+            error: 'public_slug must be lowercase letters, numbers, and hyphens only (no leading/trailing hyphen), 1-63 characters',
+          });
+        }
+        try {
+          await sql`update tenants set public_slug = ${rawSlug}, updated_at = now() where id = ${auth.tenant_id}`;
+        } catch (err) {
+          if (err && err.code === '23505') {
+            return res.status(409).json({ ok: false, error: 'That booking link is already taken. Please choose another.' });
+          }
+          throw err;
+        }
+      }
+
       if (name) {
         await sql`update tenants set name = ${name}, updated_at = now() where id = ${auth.tenant_id}`;
       }
 
       const existing = await sql`
-        select tenant_id, theme, payment_channels from tenant_settings where tenant_id = ${auth.tenant_id}
+        select tenant_id, theme, payment_channels, custom_fields, widget_template
+        from tenant_settings where tenant_id = ${auth.tenant_id}
       `;
 
-      // Only touch theme / payment_channels if the request actually included that key.
-      // Otherwise keep whatever is already saved.
+      // Only touch theme / payment_channels / custom_fields / widget_template
+      // if the request actually included that key. Otherwise keep whatever
+      // is already saved.
       let themeToSave = existing.rows.length > 0 ? existing.rows[0].theme : null;
       if (Object.prototype.hasOwnProperty.call(b, 'theme')) {
         themeToSave = sanitizeTheme(b.theme);
@@ -144,18 +258,40 @@ export default async function handler(req, res) {
       }
       const channelsJson = channelsToSave === null ? null : JSON.stringify(channelsToSave);
 
+      let customFieldsToSave = existing.rows.length > 0 ? existing.rows[0].custom_fields : [];
+      if (Object.prototype.hasOwnProperty.call(b, 'custom_fields')) {
+        const { fields, error } = sanitizeCustomFields(b.custom_fields);
+        if (error) {
+          return res.status(400).json({ ok: false, error });
+        }
+        customFieldsToSave = fields;
+      }
+      const customFieldsJson = JSON.stringify(customFieldsToSave || []);
+
+      let widgetTemplateToSave = existing.rows.length > 0 ? existing.rows[0].widget_template : 'standard';
+      if (Object.prototype.hasOwnProperty.call(b, 'widget_template')) {
+        if (!WIDGET_TEMPLATE_WHITELIST.includes(b.widget_template)) {
+          return res.status(400).json({
+            ok: false,
+            error: `widget_template must be one of: ${WIDGET_TEMPLATE_WHITELIST.join(', ')}`,
+          });
+        }
+        widgetTemplateToSave = b.widget_template;
+      }
+
       if (existing.rows.length === 0) {
         await sql`
           insert into tenant_settings
             (tenant_id, logo_url, primary_color, embed_domain, checkin_time, checkout_time,
              cancellation_policy, deposit_percent, vat_percent, min_stay_nights, booking_window_days,
-             theme, payment_channels, updated_at)
+             theme, payment_channels, custom_fields, widget_template, updated_at)
           values
             (${auth.tenant_id}, ${vals.logo_url}, ${vals.primary_color}, ${vals.embed_domain},
              ${vals.checkin_time}::time, ${vals.checkout_time}::time, ${vals.cancellation_policy},
              ${vals.deposit_percent}::numeric, ${vals.vat_percent}::numeric,
              ${vals.min_stay_nights}::integer, ${vals.booking_window_days}::integer,
-             ${themeJson}::jsonb, ${channelsJson}::jsonb, now())
+             ${themeJson}::jsonb, ${channelsJson}::jsonb, ${customFieldsJson}::jsonb,
+             ${widgetTemplateToSave}, now())
         `;
       } else {
         await sql`
@@ -172,6 +308,8 @@ export default async function handler(req, res) {
             booking_window_days = ${vals.booking_window_days}::integer,
             theme = ${themeJson}::jsonb,
             payment_channels = ${channelsJson}::jsonb,
+            custom_fields = ${customFieldsJson}::jsonb,
+            widget_template = ${widgetTemplateToSave},
             updated_at = now()
           where tenant_id = ${auth.tenant_id}
         `;
