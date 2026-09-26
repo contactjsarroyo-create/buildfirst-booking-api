@@ -25,7 +25,7 @@ function todayIn(timezone) {
 }
 
 // Shared by the price quote and the real booking, so both always agree.
-// Returns { ok: false, status, error } or { ok: true, ...amounts }.
+// Returns { ok: false, status, error } or { ok: true, ...amounts, room_id }.
 export async function computeQuote(input) {
   const { tenant_id, unit_type_id, check_in, check_out, guests, addon_ids, promo_code } = input || {};
 
@@ -80,14 +80,13 @@ export async function computeQuote(input) {
   }
 
   const unitResult = await sql`
-    SELECT base_rate, unit_count, capacity_guests FROM unit_types
+    SELECT base_rate, capacity_guests FROM unit_types
     WHERE id = ${unit_type_id} AND tenant_id = ${tenant_id} AND is_active = true
   `;
   if (unitResult.rows.length === 0) {
     return fail(404, 'Room type not found');
   }
   const baseRate = Number(unitResult.rows[0].base_rate);
-  const unitCount = Number(unitResult.rows[0].unit_count);
   const capacity = unitResult.rows[0].capacity_guests
     ? Number(unitResult.rows[0].capacity_guests)
     : null;
@@ -97,15 +96,8 @@ export async function computeQuote(input) {
     return fail(400, `This room sleeps up to ${capacity} guest${capacity === 1 ? '' : 's'}`);
   }
 
-  const overlappingBookings = await sql`
-    SELECT COUNT(*) FROM bookings
-    WHERE unit_type_id = ${unit_type_id}
-      AND tenant_id = ${tenant_id}
-      AND status = 'confirmed'
-      AND check_in < ${check_out}::date
-      AND check_out > ${check_in}::date
-  `;
-  // A block covers its first and last date, both included.
+  // A block covers its first and last date, both included. Blocks are still
+  // unit-type-level (apply to every room of that type), not per-room.
   const overlappingBlocks = await sql`
     SELECT COUNT(*) FROM availability_blocks
     WHERE unit_type_id = ${unit_type_id}
@@ -116,7 +108,36 @@ export async function computeQuote(input) {
   if (Number(overlappingBlocks.rows[0].count) > 0) {
     return fail(409, 'These dates are blocked for this room type');
   }
-  if (Number(overlappingBookings.rows[0].count) >= unitCount) {
+
+  // Per-room availability: find every active room of this type, then find
+  // which of those rooms are already taken by a confirmed booking for these
+  // dates, and pick the first one that's free.
+  const roomsResult = await sql`
+    SELECT id FROM rooms
+    WHERE unit_type_id = ${unit_type_id}
+      AND tenant_id = ${tenant_id}
+      AND is_active = true
+    ORDER BY label
+  `;
+  const allRoomIds = roomsResult.rows.map((r) => r.id);
+
+  if (allRoomIds.length === 0) {
+    return fail(409, 'No rooms have been set up for this room type yet');
+  }
+
+  const occupiedResult = await sql`
+    SELECT room_id FROM bookings
+    WHERE unit_type_id = ${unit_type_id}
+      AND tenant_id = ${tenant_id}
+      AND status = 'confirmed'
+      AND room_id IS NOT NULL
+      AND check_in < ${check_out}::date
+      AND check_out > ${check_in}::date
+  `;
+  const occupiedRoomIds = new Set(occupiedResult.rows.map((r) => r.room_id));
+  const availableRoomId = allRoomIds.find((id) => !occupiedRoomIds.has(id));
+
+  if (!availableRoomId) {
     return fail(409, 'No rooms of this type are available for the selected dates');
   }
 
@@ -191,6 +212,7 @@ export async function computeQuote(input) {
     ok: true,
     tenant_id,
     unit_type_id,
+    room_id: availableRoomId,
     check_in,
     check_out,
     nights,
