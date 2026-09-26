@@ -22,9 +22,14 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok: false, error: 'slug is required' });
     }
 
+    // Look up by public_slug first (the customizable, guest-facing link),
+    // falling back to the original internal slug so any widget page still
+    // pointed at the old value keeps working.
     const t = await sql`
-      SELECT id, name, currency, status FROM tenants
-      WHERE LOWER(slug) = ${slug.toLowerCase()}
+      SELECT id, name, currency, status, public_slug FROM tenants
+      WHERE LOWER(public_slug) = ${slug.toLowerCase()} OR LOWER(slug) = ${slug.toLowerCase()}
+      ORDER BY (LOWER(public_slug) = ${slug.toLowerCase()}) DESC
+      LIMIT 1
     `;
     if (t.rows.length === 0 || !isBookableStatus(t.rows[0].status)) {
       return res.status(404).json({ ok: false, error: 'Resort not found' });
@@ -35,7 +40,7 @@ export default async function handler(req, res) {
       SELECT primary_color, logo_url,
              checkin_time::text AS checkin_time, checkout_time::text AS checkout_time,
              cancellation_policy, vat_percent, min_stay_nights, booking_window_days,
-             theme, payment_channels
+             theme, payment_channels, custom_fields, widget_template
       FROM tenant_settings WHERE tenant_id = ${tenant.id}
     `;
     const settings = s.rows[0] || {};
@@ -55,7 +60,12 @@ export default async function handler(req, res) {
     res.setHeader('Cache-Control', 'no-store');
     return res.status(200).json({
       ok: true,
-      tenant: { id: tenant.id, name: tenant.name, currency: tenant.currency },
+      tenant: {
+        id: tenant.id,
+        name: tenant.name,
+        currency: tenant.currency,
+        public_slug: tenant.public_slug,
+      },
       settings: {
         primary_color: settings.primary_color || null,
         logo_url: settings.logo_url || null,
@@ -67,6 +77,8 @@ export default async function handler(req, res) {
         booking_window_days: settings.booking_window_days || 365,
         theme: settings.theme || null,
         payment_channels: settings.payment_channels || DEFAULT_PAYMENT_CHANNELS,
+        custom_fields: settings.custom_fields || [],
+        widget_template: settings.widget_template || 'standard',
       },
       unit_types: units.rows,
       addons: addons.rows,
