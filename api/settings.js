@@ -1,4 +1,5 @@
 import { sql } from '@vercel/postgres';
+import { put } from '@vercel/blob';
 import { setCors, getAuth, num, text } from './_lib/helpers.js';
 
 const HEX_RE = /^#[0-9a-fA-F]{6}$/;
@@ -83,9 +84,13 @@ function sanitizePaymentChannels(input) {
 // booking stores its answers keyed by `key` in
 // bookings.custom_field_responses.
 // ------------------------------------------------------------
-const CUSTOM_FIELD_TYPES = ['text', 'textarea', 'select', 'checkbox'];
+const CUSTOM_FIELD_TYPES = ['text', 'textarea', 'select', 'checkbox', 'number', 'date', 'phone', 'image_upload'];
 const CUSTOM_FIELD_KEY_RE = /^[a-z][a-z0-9_]{0,49}$/;
 const MAX_CUSTOM_FIELDS = 20;
+// Reference images are only ever URLs we generated ourselves (via the
+// upload endpoint below), so this is a sanity check against garbage
+// input, not a security boundary.
+const IMAGE_URL_RE = /^https:\/\/.+/;
 
 // Returns { fields, error }. fields is null if input is fundamentally
 // unusable; error is set (and fields null) if a specific problem should
@@ -139,6 +144,20 @@ function sanitizeCustomFields(input) {
 
     const entry = { key, label, type, required };
 
+    // Optional reference image the tenant attached while building the
+    // question (e.g. a photo shown alongside "Which building do you
+    // prefer?"). Valid on any question type, not just image_upload.
+    if (typeof f.image_url === 'string' && f.image_url.trim()) {
+      const imageUrl = f.image_url.trim();
+      if (!IMAGE_URL_RE.test(imageUrl)) {
+        return {
+          fields: null,
+          error: `custom_fields[${i}] (key: "${key}") has an invalid image_url`,
+        };
+      }
+      entry.image_url = imageUrl;
+    }
+
     if (type === 'select') {
       const options = Array.isArray(f.options)
         ? f.options
@@ -167,8 +186,34 @@ function sanitizeCustomFields(input) {
 const WIDGET_TEMPLATE_WHITELIST = ['standard', 'calendar_prices'];
 const PUBLIC_SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/; // lowercase, digits, hyphens; no leading/trailing hyphen
 
+// ------------------------------------------------------------
+// Reference-image upload for the custom-question builder. Authenticated —
+// this is the tenant attaching a photo while building a question in the
+// dashboard, not a guest uploading anything (that flow lives in
+// bookings.js instead, since it must work without a login).
+// Images arrive as a base64 data URL rather than multipart/form-data,
+// since that's simplest to send from a Framer code component. This keeps
+// the whole request under Vercel's serverless body-size limit, which
+// caps how large an image can be — see MAX_IMAGE_BYTES.
+// ------------------------------------------------------------
+const ALLOWED_IMAGE_TYPES = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+};
+const MAX_IMAGE_BYTES = 4 * 1024 * 1024; // 4MB
+
+function parseImageDataUrl(input) {
+  if (typeof input !== 'string') return null;
+  const match = /^data:(image\/(?:jpeg|png|webp));base64,(.+)$/.exec(input.trim());
+  if (!match) return null;
+  const mime = match[1];
+  const buffer = Buffer.from(match[2], 'base64');
+  return { mime, buffer };
+}
+
 export default async function handler(req, res) {
-  if (setCors(req, res, 'GET, PUT, OPTIONS')) return;
+  if (setCors(req, res, 'GET, PUT, POST, OPTIONS')) return;
 
   const auth = getAuth(req);
   if (!auth) return res.status(401).json({ ok: false, error: 'Unauthorized' });
@@ -315,6 +360,26 @@ export default async function handler(req, res) {
         `;
       }
       return res.status(200).json({ ok: true });
+    }
+
+    if (req.method === 'POST') {
+      // Reference-image upload for a custom question. auth is already
+      // required above for every method on this endpoint.
+      const b = req.body || {};
+      const parsed = parseImageDataUrl(b.image_base64);
+      if (!parsed) {
+        return res.status(400).json({
+          ok: false,
+          error: 'image_base64 must be a data URL for a JPEG, PNG, or WEBP image',
+        });
+      }
+      if (parsed.buffer.length > MAX_IMAGE_BYTES) {
+        return res.status(400).json({ ok: false, error: 'Image is too large — please use one under 4MB' });
+      }
+      const ext = ALLOWED_IMAGE_TYPES[parsed.mime];
+      const pathname = `custom-question-images/${auth.tenant_id}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+      const blob = await put(pathname, parsed.buffer, { access: 'public', contentType: parsed.mime });
+      return res.status(200).json({ ok: true, url: blob.url });
     }
 
     return res.status(405).json({ ok: false, error: 'Method not allowed' });
