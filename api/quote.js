@@ -10,7 +10,9 @@ export default async function handler(req, res) {
   try {
     const q = await computeQuote(req.body || {});
     if (!q.ok) {
-      return res.status(q.status).json({ ok: false, error: q.error });
+      return res
+        .status(q.status)
+        .json(q.code ? { ok: false, error: q.error, code: q.code } : { ok: false, error: q.error });
     }
     return res.status(200).json({
       ok: true,

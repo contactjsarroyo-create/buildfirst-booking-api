@@ -1,11 +1,11 @@
 import { sql } from '@vercel/postgres';
-import { isBookableStatus } from './helpers.js';
+import { getAccount } from './limits.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-function fail(status, error) {
-  return { ok: false, status, error };
+function fail(status, error, code) {
+  return code ? { ok: false, status, error, code } : { ok: false, status, error };
 }
 
 function round2(n) {
@@ -50,13 +50,18 @@ export async function computeQuote(input) {
   }
 
   const tenantResult = await sql`
-    SELECT timezone, status FROM tenants WHERE id = ${tenant_id}
+    SELECT timezone FROM tenants WHERE id = ${tenant_id}
   `;
   if (tenantResult.rows.length === 0) {
     return fail(404, 'Resort not found');
   }
-  if (!isBookableStatus(tenantResult.rows[0].status)) {
-    return fail(403, 'This resort is not accepting bookings right now');
+  const account = await getAccount(tenant_id);
+  if (!account || !account.can_book) {
+    return fail(
+      403,
+      'This resort is not accepting bookings right now',
+      account ? account.blocked_code : 'account_inactive'
+    );
   }
   const today = todayIn(tenantResult.rows[0].timezone);
 
