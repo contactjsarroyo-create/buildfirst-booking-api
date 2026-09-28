@@ -47,33 +47,41 @@ function sanitizeTheme(input) {
 // ------------------------------------------------------------
 // Payment channels: which ways a guest can pay this tenant.
 // "paymongo" has no manual fields (future automatic integration).
-// The others are manually confirmed channels with tenant-provided
-// details shown to the guest at checkout.
+// Every other channel is a tenant-created "custom" channel: the tenant
+// types any name they want (GCash, BPI, Maya, ...) plus an account name,
+// account number and optional instructions shown to the guest at checkout.
+// Custom channels are stored under keys that start with "custom_".
 // ------------------------------------------------------------
-const PAYMENT_CHANNEL_KEYS = ['paymongo', 'bank_transfer', 'gcash', 'maya', 'qr_code'];
-
-const CHANNEL_FIELDS = {
-  paymongo: [],
-  bank_transfer: ['bank_name', 'account_name', 'account_number', 'instructions'],
-  gcash: ['account_name', 'number', 'instructions'],
-  maya: ['account_name', 'number', 'instructions'],
-  qr_code: ['image_url', 'label'],
-};
+const CUSTOM_CHANNEL_KEY_RE = /^custom_[a-z0-9_]{1,50}$/;
+const MAX_CUSTOM_CHANNELS = 20;
+const CUSTOM_CHANNEL_TEXT_FIELDS = ['account_name', 'account_number', 'instructions'];
 
 function sanitizePaymentChannels(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
 
   const out = {};
-  for (const key of PAYMENT_CHANNEL_KEYS) {
-    const ch = input[key];
-    const enabled = !!(ch && ch.enabled === true);
-    out[key] = { enabled };
 
-    const fields = CHANNEL_FIELDS[key] || [];
-    for (const field of fields) {
-      const v = ch && ch[field];
-      out[key][field] = typeof v === 'string' ? v.slice(0, 500) : null;
+  const pm = input.paymongo;
+  out.paymongo = { enabled: !!(pm && pm.enabled === true) };
+
+  let customCount = 0;
+  for (const key of Object.keys(input)) {
+    if (!CUSTOM_CHANNEL_KEY_RE.test(key)) continue;
+    if (customCount >= MAX_CUSTOM_CHANNELS) break;
+
+    const ch = input[key];
+    if (!ch || typeof ch !== 'object' || Array.isArray(ch)) continue;
+
+    const name = typeof ch.name === 'string' ? ch.name.trim().slice(0, 100) : '';
+    if (!name) continue; // a channel with no name can't be shown to guests
+
+    const entry = { custom: true, enabled: ch.enabled === true, name };
+    for (const field of CUSTOM_CHANNEL_TEXT_FIELDS) {
+      const v = ch[field];
+      entry[field] = typeof v === 'string' ? v.trim().slice(0, 500) : '';
     }
+    out[key] = entry;
+    customCount++;
   }
   return out;
 }
@@ -181,6 +189,30 @@ function sanitizeCustomFields(input) {
 }
 
 // ------------------------------------------------------------
+// Guest-details section config: lets the tenant rename the "Your details"
+// heading/labels and choose whether phone and special requests are hidden,
+// optional, or required. Name and email are always asked (the confirmation
+// email needs the address), so they only get renamable labels.
+// Unknown keys are dropped; blank labels fall back to the widget defaults.
+// ------------------------------------------------------------
+const DETAILS_MODES = ['hidden', 'optional', 'required'];
+const DETAILS_LABEL_KEYS = ['title', 'name_label', 'email_label', 'phone_label', 'requests_label'];
+const DETAILS_MODE_KEYS = ['phone_mode', 'requests_mode'];
+
+function sanitizeDetailsConfig(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return {};
+  const out = {};
+  for (const key of DETAILS_LABEL_KEYS) {
+    const v = input[key];
+    if (typeof v === 'string' && v.trim()) out[key] = v.trim().slice(0, 100);
+  }
+  for (const key of DETAILS_MODE_KEYS) {
+    if (DETAILS_MODES.includes(input[key])) out[key] = input[key];
+  }
+  return out;
+}
+
+// ------------------------------------------------------------
 // Widget template + public slug
 // ------------------------------------------------------------
 const WIDGET_TEMPLATE_WHITELIST = ['standard', 'calendar_prices'];
@@ -228,7 +260,7 @@ export default async function handler(req, res) {
                checkin_time::text as checkin_time, checkout_time::text as checkout_time,
                cancellation_policy, deposit_percent, vat_percent,
                min_stay_nights, booking_window_days, theme, payment_channels,
-               custom_fields, widget_template
+               custom_fields, widget_template, details_config
         from tenant_settings where tenant_id = ${auth.tenant_id}
       `;
       return res.status(200).json({
@@ -284,7 +316,7 @@ export default async function handler(req, res) {
       }
 
       const existing = await sql`
-        select tenant_id, theme, payment_channels, custom_fields, widget_template
+        select tenant_id, theme, payment_channels, custom_fields, widget_template, details_config
         from tenant_settings where tenant_id = ${auth.tenant_id}
       `;
 
@@ -324,19 +356,25 @@ export default async function handler(req, res) {
         widgetTemplateToSave = b.widget_template;
       }
 
+      let detailsToSave = existing.rows.length > 0 && existing.rows[0].details_config ? existing.rows[0].details_config : {};
+      if (Object.prototype.hasOwnProperty.call(b, 'details_config')) {
+        detailsToSave = sanitizeDetailsConfig(b.details_config);
+      }
+      const detailsJson = JSON.stringify(detailsToSave);
+
       if (existing.rows.length === 0) {
         await sql`
           insert into tenant_settings
             (tenant_id, logo_url, primary_color, embed_domain, checkin_time, checkout_time,
              cancellation_policy, deposit_percent, vat_percent, min_stay_nights, booking_window_days,
-             theme, payment_channels, custom_fields, widget_template, updated_at)
+             theme, payment_channels, custom_fields, widget_template, details_config, updated_at)
           values
             (${auth.tenant_id}, ${vals.logo_url}, ${vals.primary_color}, ${vals.embed_domain},
              ${vals.checkin_time}::time, ${vals.checkout_time}::time, ${vals.cancellation_policy},
              ${vals.deposit_percent}::numeric, ${vals.vat_percent}::numeric,
              ${vals.min_stay_nights}::integer, ${vals.booking_window_days}::integer,
              ${themeJson}::jsonb, ${channelsJson}::jsonb, ${customFieldsJson}::jsonb,
-             ${widgetTemplateToSave}, now())
+             ${widgetTemplateToSave}, ${detailsJson}::jsonb, now())
         `;
       } else {
         await sql`
@@ -355,6 +393,7 @@ export default async function handler(req, res) {
             payment_channels = ${channelsJson}::jsonb,
             custom_fields = ${customFieldsJson}::jsonb,
             widget_template = ${widgetTemplateToSave},
+            details_config = ${detailsJson}::jsonb,
             updated_at = now()
           where tenant_id = ${auth.tenant_id}
         `;
