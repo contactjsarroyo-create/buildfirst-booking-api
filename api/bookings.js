@@ -1,9 +1,168 @@
 import { sql } from '@vercel/postgres';
-import { setCors, getAuth } from './_lib/helpers.js';
+import { put } from '@vercel/blob';
+import { setCors, getAuth, isBookableStatus } from './_lib/helpers.js';
 import { computeQuote } from './_lib/pricing.js';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const PAYMENT_CHANNEL_KEYS = ['paymongo', 'bank_transfer', 'gcash', 'maya', 'qr_code'];
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// "paymongo" is the built-in channel. Channels a tenant creates themselves are stored
+// under keys that start with "custom_" (see settings.js). The old fixed keys are still
+// accepted so a resort that hasn't re-saved its payment settings yet keeps working.
+const LEGACY_PAYMENT_CHANNEL_KEYS = ['bank_transfer', 'gcash', 'maya', 'qr_code'];
+const CUSTOM_CHANNEL_KEY_RE = /^custom_[a-z0-9_]{1,50}$/;
+
+function isValidPaymentChannelKey(key) {
+  return key === 'paymongo' || LEGACY_PAYMENT_CHANNEL_KEYS.includes(key) || CUSTOM_CHANNEL_KEY_RE.test(key);
+}
+
+// Kept in sync with settings.js's CUSTOM_FIELD_TYPES.
+const CUSTOM_FIELD_TYPES = ['text', 'textarea', 'select', 'checkbox', 'number', 'date', 'phone', 'image_upload'];
+// A guest-uploaded image answer is only ever a URL our own upload action
+// generated, so this is a sanity check, not a security boundary.
+const IMAGE_URL_RE = /^https:\/\/.+/;
+
+// ------------------------------------------------------------
+// Guest-facing image upload for an image_upload custom question answer.
+// Public / no auth — mirrors settings.js's authenticated reference-image
+// upload, but writes under guest-uploads/ instead of
+// custom-question-images/, and checks the tenant exists + is bookable
+// instead of checking a JWT, since there's no login here.
+// Kept in this file rather than a new route file: the project is at
+// Vercel Hobby's 12-serverless-function cap.
+// ------------------------------------------------------------
+const ALLOWED_IMAGE_TYPES = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+};
+const MAX_IMAGE_BYTES = 4 * 1024 * 1024; // 4MB
+
+function parseImageDataUrl(input) {
+  if (typeof input !== 'string') return null;
+  const match = /^data:(image\/(?:jpeg|png|webp));base64,(.+)$/.exec(input.trim());
+  if (!match) return null;
+  const mime = match[1];
+  const buffer = Buffer.from(match[2], 'base64');
+  return { mime, buffer };
+}
+
+async function handleGuestImageUpload(req, res) {
+  const b = req.body || {};
+  if (!b.tenant_id || !UUID_RE.test(String(b.tenant_id))) {
+    return res.status(400).json({ ok: false, error: 'A valid tenant_id is required' });
+  }
+
+  const tenantResult = await sql`
+    SELECT status FROM tenants WHERE id = ${b.tenant_id}
+  `;
+  if (tenantResult.rows.length === 0) {
+    return res.status(404).json({ ok: false, error: 'Resort not found' });
+  }
+  if (!isBookableStatus(tenantResult.rows[0].status)) {
+    return res.status(403).json({ ok: false, error: 'This resort is not accepting bookings right now' });
+  }
+
+  const parsed = parseImageDataUrl(b.image_base64);
+  if (!parsed) {
+    return res.status(400).json({
+      ok: false,
+      error: 'image_base64 must be a data URL for a JPEG, PNG, or WEBP image',
+    });
+  }
+  if (parsed.buffer.length > MAX_IMAGE_BYTES) {
+    return res.status(400).json({ ok: false, error: 'Image is too large — please use one under 4MB' });
+  }
+  const ext = ALLOWED_IMAGE_TYPES[parsed.mime];
+  const pathname = `guest-uploads/${b.tenant_id}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+  const blob = await put(pathname, parsed.buffer, { access: 'public', contentType: parsed.mime });
+  return res.status(200).json({ ok: true, url: blob.url });
+}
+
+// ------------------------------------------------------------
+// Validates a guest's custom_field_responses against the tenant's
+// custom_fields definitions. Unknown keys (not defined by the tenant)
+// are silently dropped rather than erroring, since the widget and the
+// tenant's saved fields could briefly be out of sync. Returns
+// { values, error }: error is set (values null) only when a defined
+// field fails validation, since that should block the booking rather
+// than silently lose the guest's answer.
+// ------------------------------------------------------------
+function validateCustomFieldResponses(customFields, responses) {
+  const fields = Array.isArray(customFields) ? customFields : [];
+  const input = responses && typeof responses === 'object' && !Array.isArray(responses) ? responses : {};
+
+  const out = {};
+
+  for (const field of fields) {
+    const raw = input[field.key];
+    const isEmpty = raw === undefined || raw === null || raw === '';
+
+    if (isEmpty) {
+      if (field.required) {
+        return { values: null, error: `"${field.label}" is required` };
+      }
+      continue;
+    }
+
+    switch (field.type) {
+      case 'select': {
+        const options = Array.isArray(field.options) ? field.options : [];
+        if (!options.includes(raw)) {
+          return { values: null, error: `"${field.label}" must be one of: ${options.join(', ')}` };
+        }
+        out[field.key] = raw;
+        break;
+      }
+      case 'checkbox': {
+        out[field.key] = raw === true || raw === 'true';
+        break;
+      }
+      case 'number': {
+        const n = Number(raw);
+        if (Number.isNaN(n)) {
+          return { values: null, error: `"${field.label}" must be a number` };
+        }
+        out[field.key] = n;
+        break;
+      }
+      case 'date': {
+        if (!DATE_RE.test(String(raw))) {
+          return { values: null, error: `"${field.label}" must be a date in YYYY-MM-DD format` };
+        }
+        out[field.key] = String(raw);
+        break;
+      }
+      case 'phone': {
+        const phone = String(raw).trim().slice(0, 40);
+        if (phone.replace(/[^0-9]/g, '').length < 7) {
+          return { values: null, error: `"${field.label}" doesn't look like a valid phone number` };
+        }
+        out[field.key] = phone;
+        break;
+      }
+      case 'image_upload': {
+        const url = String(raw).trim();
+        if (!IMAGE_URL_RE.test(url)) {
+          return { values: null, error: `"${field.label}" must be an uploaded image` };
+        }
+        out[field.key] = url;
+        break;
+      }
+      case 'textarea': {
+        out[field.key] = String(raw).trim().slice(0, 2000);
+        break;
+      }
+      case 'text':
+      default: {
+        out[field.key] = String(raw).trim().slice(0, 500);
+        break;
+      }
+    }
+  }
+
+  return { values: out, error: null };
+}
 
 export default async function handler(req, res) {
   if (setCors(req, res, 'GET, POST, OPTIONS')) return;
@@ -28,6 +187,20 @@ export default async function handler(req, res) {
     // POST stays open with no login required - this is the public guest-facing
     // booking widget, not the dashboard. tenant_id comes from the widget's config.
     const b = req.body || {};
+
+    // A single sibling action multiplexed onto POST rather than a new route
+    // file — the project is at Vercel Hobby's 12-function cap. Must be
+    // explicit (action: 'upload_image') so it can never be confused with a
+    // real booking submission.
+    if (b.action === 'upload_image') {
+      try {
+        return await handleGuestImageUpload(req, res);
+      } catch (err) {
+        console.error(err);
+        return res.status(500).json({ ok: false, error: 'Server error' });
+      }
+    }
+
     const guest_name = String(b.guest_name || '').trim().slice(0, 120);
     const guest_email = String(b.guest_email || '').trim().slice(0, 200);
     const guest_phone = b.guest_phone ? String(b.guest_phone).trim().slice(0, 40) : null;
@@ -44,22 +217,29 @@ export default async function handler(req, res) {
     if (!EMAIL_RE.test(guest_email)) {
       return res.status(400).json({ ok: false, error: 'Please enter a valid email address' });
     }
-    if (!payment_channel || !PAYMENT_CHANNEL_KEYS.includes(payment_channel)) {
-      return res.status(400).json({
-        ok: false,
-        error: `payment_channel is required and must be one of: ${PAYMENT_CHANNEL_KEYS.join(', ')}`,
-      });
+    if (!payment_channel || !isValidPaymentChannelKey(payment_channel)) {
+      return res.status(400).json({ ok: false, error: 'Please choose a valid payment method' });
     }
 
     try {
-      // Confirm the tenant actually has this channel enabled before accepting the booking.
+      // Confirm the tenant actually has this channel enabled before accepting the booking,
+      // and grab custom_fields in the same query so we can validate the guest's answers.
       const settingsResult = await sql`
-        SELECT payment_channels FROM tenant_settings WHERE tenant_id = ${b.tenant_id}
+        SELECT payment_channels, custom_fields FROM tenant_settings WHERE tenant_id = ${b.tenant_id}
       `;
       const channels = settingsResult.rows[0] ? settingsResult.rows[0].payment_channels : null;
       const channelConfig = channels ? channels[payment_channel] : null;
       if (!channelConfig || channelConfig.enabled !== true) {
         return res.status(400).json({ ok: false, error: 'That payment method is not available for this resort' });
+      }
+
+      const customFields = settingsResult.rows[0] ? settingsResult.rows[0].custom_fields : [];
+      const { values: customFieldResponses, error: customFieldError } = validateCustomFieldResponses(
+        customFields,
+        b.custom_field_responses
+      );
+      if (customFieldError) {
+        return res.status(400).json({ ok: false, error: customFieldError });
       }
 
       const q = await computeQuote(b);
@@ -69,16 +249,16 @@ export default async function handler(req, res) {
 
       const result = await sql`
         INSERT INTO bookings (
-          tenant_id, unit_type_id, guest_name, guest_email, guest_phone,
+          tenant_id, unit_type_id, room_id, guest_name, guest_email, guest_phone,
           check_in, check_out, guests, special_requests, base_amount, addons_amount,
           vat_amount, discount_amount, total_amount, promo_code_id,
-          payment_channel, payment_reference
+          payment_channel, payment_reference, custom_field_responses
         )
         VALUES (
-          ${q.tenant_id}, ${q.unit_type_id}, ${guest_name}, ${guest_email}, ${guest_phone},
+          ${q.tenant_id}, ${q.unit_type_id}, ${q.room_id}, ${guest_name}, ${guest_email}, ${guest_phone},
           ${q.check_in}, ${q.check_out}, ${q.guests}, ${special_requests}, ${q.base_amount}, ${q.addons_amount},
           ${q.vat_amount}, ${q.discount_amount}, ${q.total_amount}, ${q.promo_code_id},
-          ${payment_channel}, ${payment_reference}
+          ${payment_channel}, ${payment_reference}, ${JSON.stringify(customFieldResponses)}::jsonb
         )
         RETURNING *
       `;

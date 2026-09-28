@@ -1,13 +1,10 @@
 import { sql } from '@vercel/postgres';
 import { setCors, text, isBookableStatus } from './_lib/helpers.js';
 
-// Matches the shape in settings.js's CHANNEL_FIELDS — keep them in sync if either changes.
+// Only PayMongo is built in. Any other channel is created by the tenant and stored
+// under a "custom_..." key (see settings.js), so there is nothing else to default.
 const DEFAULT_PAYMENT_CHANNELS = {
   paymongo: { enabled: false },
-  bank_transfer: { enabled: false, bank_name: null, account_name: null, account_number: null, instructions: null },
-  gcash: { enabled: false, account_name: null, number: null, instructions: null },
-  maya: { enabled: false, account_name: null, number: null, instructions: null },
-  qr_code: { enabled: false, image_url: null, label: null },
 };
 
 export default async function handler(req, res) {
@@ -40,7 +37,7 @@ export default async function handler(req, res) {
       SELECT primary_color, logo_url,
              checkin_time::text AS checkin_time, checkout_time::text AS checkout_time,
              cancellation_policy, vat_percent, min_stay_nights, booking_window_days,
-             theme, payment_channels, custom_fields, widget_template
+             theme, payment_channels, custom_fields, widget_template, details_config
       FROM tenant_settings WHERE tenant_id = ${tenant.id}
     `;
     const settings = s.rows[0] || {};
@@ -79,6 +76,7 @@ export default async function handler(req, res) {
         payment_channels: settings.payment_channels || DEFAULT_PAYMENT_CHANNELS,
         custom_fields: settings.custom_fields || [],
         widget_template: settings.widget_template || 'standard',
+        details_config: settings.details_config || {},
       },
       unit_types: units.rows,
       addons: addons.rows,
