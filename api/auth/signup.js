@@ -5,7 +5,9 @@ import { setCors, text } from '../_lib/helpers.js';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const PLAN_WHITELIST = ['starter', 'growth', 'pro'];
-const TRIAL_DAYS = 14;
+// Keep in sync with TRIAL_DAYS in DashboardSignup.tsx.
+// The trial runs on Starter limits; `plan` below is the plan they move to after it.
+const TRIAL_DAYS = 7;
 
 function slugify(name) {
   const base = String(name || '')

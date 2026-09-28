@@ -96,18 +96,20 @@ export async function computeQuote(input) {
     return fail(400, `This room sleeps up to ${capacity} guest${capacity === 1 ? '' : 's'}`);
   }
 
-  // A block covers its first and last date, both included. Blocks are still
-  // unit-type-level (apply to every room of that type), not per-room.
+  // A block covers its first and last date, both included. room_ids NULL
+  // blocks every room of the type; otherwise only the listed rooms.
   const overlappingBlocks = await sql`
-    SELECT COUNT(*) FROM availability_blocks
+    SELECT room_ids::text[] AS room_ids FROM availability_blocks
     WHERE unit_type_id = ${unit_type_id}
       AND tenant_id = ${tenant_id}
       AND start_date < ${check_out}::date
       AND end_date >= ${check_in}::date
   `;
-  if (Number(overlappingBlocks.rows[0].count) > 0) {
+  if (overlappingBlocks.rows.some((r) => !r.room_ids)) {
     return fail(409, 'These dates are blocked for this room type');
   }
+  const blockedRoomIds = new Set();
+  overlappingBlocks.rows.forEach((r) => r.room_ids.forEach((id) => blockedRoomIds.add(id)));
 
   // Per-room availability: find every active room of this type, then find
   // which of those rooms are already taken by a confirmed booking for these
@@ -135,9 +137,14 @@ export async function computeQuote(input) {
       AND check_out > ${check_in}::date
   `;
   const occupiedRoomIds = new Set(occupiedResult.rows.map((r) => r.room_id));
-  const availableRoomId = allRoomIds.find((id) => !occupiedRoomIds.has(id));
+  const availableRoomId = allRoomIds.find(
+    (id) => !occupiedRoomIds.has(id) && !blockedRoomIds.has(id)
+  );
 
   if (!availableRoomId) {
+    if (allRoomIds.every((id) => blockedRoomIds.has(id))) {
+      return fail(409, 'These dates are blocked for this room type');
+    }
     return fail(409, 'No rooms of this type are available for the selected dates');
   }
 

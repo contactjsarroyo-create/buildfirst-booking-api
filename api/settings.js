@@ -1,6 +1,16 @@
 import { sql } from '@vercel/postgres';
 import { put } from '@vercel/blob';
 import { setCors, getAuth, num, text } from './_lib/helpers.js';
+import {
+  getAccount,
+  getUsage,
+  publicAccount,
+  planLimit,
+  blocked,
+  reserveStorage,
+  releaseStorage,
+  formatBytes,
+} from './_lib/limits.js';
 
 const HEX_RE = /^#[0-9a-fA-F]{6}$/;
 const FONT_WHITELIST = [
@@ -91,10 +101,12 @@ function sanitizePaymentChannels(input) {
 // step of the booking widget. Stored as an ordered array; each
 // booking stores its answers keyed by `key` in
 // bookings.custom_field_responses.
+// MAX_CUSTOM_FIELDS is the absolute ceiling (the Pro plan's limit);
+// each plan's own, lower limit is enforced in the PUT handler below.
 // ------------------------------------------------------------
 const CUSTOM_FIELD_TYPES = ['text', 'textarea', 'select', 'checkbox', 'number', 'date', 'phone', 'image_upload'];
 const CUSTOM_FIELD_KEY_RE = /^[a-z][a-z0-9_]{0,49}$/;
-const MAX_CUSTOM_FIELDS = 20;
+const MAX_CUSTOM_FIELDS = 40;
 // Reference images are only ever URLs we generated ourselves (via the
 // upload endpoint below), so this is a sanity check against garbage
 // input, not a security boundary.
@@ -227,6 +239,7 @@ const PUBLIC_SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/; // lowercase, d
 // since that's simplest to send from a Framer code component. This keeps
 // the whole request under Vercel's serverless body-size limit, which
 // caps how large an image can be — see MAX_IMAGE_BYTES.
+// Uploads count against the tenant's plan storage limit.
 // ------------------------------------------------------------
 const ALLOWED_IMAGE_TYPES = {
   'image/jpeg': 'jpg',
@@ -263,10 +276,33 @@ export default async function handler(req, res) {
                custom_fields, widget_template, details_config
         from tenant_settings where tenant_id = ${auth.tenant_id}
       `;
+
+      // Account state, plan limits and current usage, for the dashboard's
+      // trial banner, "pick a plan" screen and usage meters.
+      const account = await getAccount(auth.tenant_id);
+      let accountJson = null;
+      let usageJson = null;
+      let limitsJson = null;
+      if (account) {
+        const usage = await getUsage(auth.tenant_id);
+        accountJson = publicAccount(account);
+        limitsJson = account.limits;
+        usageJson = {
+          unit_types: usage.unit_types,
+          rooms: Math.max(usage.rooms, usage.unit_count_total),
+          custom_fields: usage.custom_fields,
+          bookings_this_month: usage.bookings_this_month,
+          storage_bytes: usage.storage_bytes,
+        };
+      }
+
       return res.status(200).json({
         ok: true,
         tenant: t.rows[0] || null,
         settings: s.rows[0] || null,
+        account: accountJson,
+        limits: limitsJson,
+        usage: usageJson,
       });
     }
 
@@ -341,6 +377,26 @@ export default async function handler(req, res) {
         if (error) {
           return res.status(400).json({ ok: false, error });
         }
+
+        // Plan limit on custom questions. Only blocks when the list is
+        // growing past the limit, so a tenant who is over it (after a
+        // downgrade) can still edit or trim their questions.
+        const existingCount =
+          existing.rows.length > 0 && Array.isArray(existing.rows[0].custom_fields)
+            ? existing.rows[0].custom_fields.length
+            : 0;
+        if (fields.length > existingCount) {
+          const account = await getAccount(auth.tenant_id);
+          if (account && fields.length > account.limits.custom_fields) {
+            return planLimit(
+              res,
+              account,
+              `Your ${account.label} allows up to ${account.limits.custom_fields} custom questions.`,
+              'custom_fields'
+            );
+          }
+        }
+
         customFieldsToSave = fields;
       }
       const customFieldsJson = JSON.stringify(customFieldsToSave || []);
@@ -405,6 +461,11 @@ export default async function handler(req, res) {
       // Reference-image upload for a custom question. auth is already
       // required above for every method on this endpoint.
       const b = req.body || {};
+
+      const account = await getAccount(auth.tenant_id);
+      if (!account) return res.status(404).json({ ok: false, error: 'Account not found' });
+      if (!account.can_book) return blocked(res, account);
+
       const parsed = parseImageDataUrl(b.image_base64);
       if (!parsed) {
         return res.status(400).json({
@@ -415,9 +476,27 @@ export default async function handler(req, res) {
       if (parsed.buffer.length > MAX_IMAGE_BYTES) {
         return res.status(400).json({ ok: false, error: 'Image is too large — please use one under 4MB' });
       }
+
+      const size = parsed.buffer.length;
+      const reserved = await reserveStorage(auth.tenant_id, size, account.limits.storage_bytes);
+      if (!reserved) {
+        return planLimit(
+          res,
+          account,
+          `Your ${account.label} includes ${formatBytes(account.limits.storage_bytes)} of photo storage and it's full.`,
+          'storage'
+        );
+      }
+
       const ext = ALLOWED_IMAGE_TYPES[parsed.mime];
       const pathname = `custom-question-images/${auth.tenant_id}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
-      const blob = await put(pathname, parsed.buffer, { access: 'public', contentType: parsed.mime });
+      let blob;
+      try {
+        blob = await put(pathname, parsed.buffer, { access: 'public', contentType: parsed.mime });
+      } catch (err) {
+        await releaseStorage(auth.tenant_id, size);
+        throw err;
+      }
       return res.status(200).json({ ok: true, url: blob.url });
     }
 

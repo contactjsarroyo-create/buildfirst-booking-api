@@ -1,7 +1,8 @@
 import { sql } from '@vercel/postgres';
 import { put } from '@vercel/blob';
-import { setCors, getAuth, isBookableStatus } from './_lib/helpers.js';
+import { setCors, getAuth } from './_lib/helpers.js';
 import { computeQuote } from './_lib/pricing.js';
+import { getAccount, countBookingsThisMonth, reserveStorage, releaseStorage } from './_lib/limits.js';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -22,12 +23,17 @@ const CUSTOM_FIELD_TYPES = ['text', 'textarea', 'select', 'checkbox', 'number', 
 // generated, so this is a sanity check, not a security boundary.
 const IMAGE_URL_RE = /^https:\/\/.+/;
 
+// Message shown to guests when the resort can't take bookings. Deliberately
+// vague: guests shouldn't see the resort's billing state.
+const GUEST_CLOSED_MESSAGE = 'This resort is not accepting bookings right now';
+
 // ------------------------------------------------------------
 // Guest-facing image upload for an image_upload custom question answer.
 // Public / no auth — mirrors settings.js's authenticated reference-image
 // upload, but writes under guest-uploads/ instead of
 // custom-question-images/, and checks the tenant exists + is bookable
 // instead of checking a JWT, since there's no login here.
+// Guest uploads count against the resort's photo storage limit.
 // Kept in this file rather than a new route file: the project is at
 // Vercel Hobby's 12-serverless-function cap.
 // ------------------------------------------------------------
@@ -53,14 +59,12 @@ async function handleGuestImageUpload(req, res) {
     return res.status(400).json({ ok: false, error: 'A valid tenant_id is required' });
   }
 
-  const tenantResult = await sql`
-    SELECT status FROM tenants WHERE id = ${b.tenant_id}
-  `;
-  if (tenantResult.rows.length === 0) {
+  const account = await getAccount(b.tenant_id);
+  if (!account) {
     return res.status(404).json({ ok: false, error: 'Resort not found' });
   }
-  if (!isBookableStatus(tenantResult.rows[0].status)) {
-    return res.status(403).json({ ok: false, error: 'This resort is not accepting bookings right now' });
+  if (!account.can_book) {
+    return res.status(403).json({ ok: false, error: GUEST_CLOSED_MESSAGE });
   }
 
   const parsed = parseImageDataUrl(b.image_base64);
@@ -73,9 +77,26 @@ async function handleGuestImageUpload(req, res) {
   if (parsed.buffer.length > MAX_IMAGE_BYTES) {
     return res.status(400).json({ ok: false, error: 'Image is too large — please use one under 4MB' });
   }
+
+  const size = parsed.buffer.length;
+  const reserved = await reserveStorage(b.tenant_id, size, account.limits.storage_bytes);
+  if (!reserved) {
+    return res.status(403).json({
+      ok: false,
+      error: "This resort can't accept more photo uploads right now. Please contact them directly.",
+      code: 'storage_full',
+    });
+  }
+
   const ext = ALLOWED_IMAGE_TYPES[parsed.mime];
   const pathname = `guest-uploads/${b.tenant_id}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
-  const blob = await put(pathname, parsed.buffer, { access: 'public', contentType: parsed.mime });
+  let blob;
+  try {
+    blob = await put(pathname, parsed.buffer, { access: 'public', contentType: parsed.mime });
+  } catch (err) {
+    await releaseStorage(b.tenant_id, size);
+    throw err;
+  }
   return res.status(200).json({ ok: true, url: blob.url });
 }
 
@@ -214,6 +235,9 @@ export default async function handler(req, res) {
         error: 'tenant_id, unit_type_id, guest_name, guest_email, check_in, check_out are required',
       });
     }
+    if (!UUID_RE.test(String(b.tenant_id))) {
+      return res.status(400).json({ ok: false, error: 'A valid tenant_id is required' });
+    }
     if (!EMAIL_RE.test(guest_email)) {
       return res.status(400).json({ ok: false, error: 'Please enter a valid email address' });
     }
@@ -222,6 +246,24 @@ export default async function handler(req, res) {
     }
 
     try {
+      // Trial / plan gate: expired trials and inactive accounts take no new
+      // bookings, and every plan has a monthly booking cap.
+      const account = await getAccount(b.tenant_id);
+      if (!account) {
+        return res.status(404).json({ ok: false, error: 'Resort not found' });
+      }
+      if (!account.can_book) {
+        return res.status(403).json({ ok: false, error: GUEST_CLOSED_MESSAGE, code: account.blocked_code });
+      }
+      const bookingsThisMonth = await countBookingsThisMonth(b.tenant_id);
+      if (bookingsThisMonth >= account.limits.bookings_per_month) {
+        return res.status(403).json({
+          ok: false,
+          error: 'This resort has reached its booking limit for this month. Please contact them directly to book.',
+          code: 'booking_limit',
+        });
+      }
+
       // Confirm the tenant actually has this channel enabled before accepting the booking,
       // and grab custom_fields in the same query so we can validate the guest's answers.
       const settingsResult = await sql`
