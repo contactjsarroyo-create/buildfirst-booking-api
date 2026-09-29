@@ -4,6 +4,7 @@ import { setCors, getAuth } from './_lib/helpers.js';
 import { computeQuote } from './_lib/pricing.js';
 import { getAccount, countBookingsThisMonth, reserveStorage, releaseStorage } from './_lib/limits.js';
 import { recordFileOrRollback, linkFilesToBooking } from './_lib/storage.js';
+import { sendBookingCreatedEmails, withTimeout } from './_lib/bookingemails.js';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -347,6 +348,12 @@ export default async function handler(req, res) {
           UPDATE promo_codes SET times_used = times_used + 1 WHERE id = ${q.promo_code_id}
         `;
       }
+
+      // Booking emails (owner alert + guest "we got your booking"). Must finish
+      // before we answer, because Vercel can stop the function once the response
+      // is sent. Never throws, and waits at most a few seconds, so a mail problem
+      // can't fail or delay the booking beyond that.
+      await withTimeout(sendBookingCreatedEmails(b.tenant_id, booking, account));
 
       return res.status(201).json({ ok: true, booking });
     } catch (err) {

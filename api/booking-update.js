@@ -1,5 +1,6 @@
 import { sql } from '@vercel/postgres';
 import { setCors, getAuth } from './_lib/helpers.js';
+import { sendBookingConfirmedEmail, withTimeout } from './_lib/bookingemails.js';
 
 export default async function handler(req, res) {
   if (setCors(req, res, 'PATCH, OPTIONS')) return;
@@ -100,7 +101,15 @@ export default async function handler(req, res) {
     if (final.rows.length === 0) {
       return res.status(404).json({ ok: false, error: 'Booking not found' });
     }
-    return res.status(200).json({ ok: true, booking: final.rows[0] });
+
+    // When the owner confirms a booking, email the guest once. Best effort:
+    // never fails the update, and waits only a few seconds.
+    let guestEmailed = false;
+    if (status === 'confirmed') {
+      guestEmailed = (await withTimeout(sendBookingConfirmedEmail(auth.tenant_id, id))) === true;
+    }
+
+    return res.status(200).json({ ok: true, booking: final.rows[0], guest_emailed: guestEmailed });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ ok: false, error: 'Server error' });

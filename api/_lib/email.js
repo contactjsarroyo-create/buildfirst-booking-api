@@ -20,17 +20,36 @@ export function appLink(params) {
   return url.toString();
 }
 
+// Builds the From header. With a fromName the sender shows as
+// "Sunset Cove via Buildfirst" but still uses the verified address from EMAIL_FROM.
+function buildFrom(fromName) {
+  const base = process.env.EMAIL_FROM || 'Buildfirst <onboarding@resend.dev>';
+  if (!fromName) return base;
+  const match = /<([^>]+)>/.exec(base);
+  const address = (match ? match[1] : base).trim();
+  const name = String(fromName)
+    .replace(/["<>\\\r\n]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 60);
+  if (!name) return base;
+  return `"${name}" <${address}>`;
+}
+
 // Returns { ok: true } or { ok: false, error }. Never throws.
-export async function sendEmail({ to, subject, html, text }) {
+//   replyTo    optional address replies should go to
+//   fromName   optional display name for the sender
+//   timeoutMs  optional, defaults to 8 seconds
+export async function sendEmail({ to, subject, html, text, replyTo, fromName, timeoutMs }) {
   const key = process.env.RESEND_API_KEY;
   if (!key) {
     console.error('sendEmail: RESEND_API_KEY is not set');
     return { ok: false, error: 'not_configured' };
   }
 
-  const from = process.env.EMAIL_FROM || 'Buildfirst <onboarding@resend.dev>';
+  const from = buildFrom(fromName);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs || SEND_TIMEOUT_MS);
 
   try {
     const res = await fetch('https://api.resend.com/emails', {
@@ -39,7 +58,14 @@ export async function sendEmail({ to, subject, html, text }) {
         Authorization: `Bearer ${key}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ from, to: [to], subject, html, text }),
+      body: JSON.stringify({
+        from,
+        to: [to],
+        subject,
+        html,
+        text,
+        ...(replyTo ? { reply_to: replyTo } : {}),
+      }),
       signal: controller.signal,
     });
 

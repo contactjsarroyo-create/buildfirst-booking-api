@@ -7,15 +7,18 @@ import { sql } from '@vercel/postgres';
 //   bookings_per_month  bookings created per calendar month (Asia/Manila)
 //   storage_bytes       total uploaded image storage (never resets)
 //   custom_fields       custom guest questions
-// Not enforced yet (nothing to enforce): emails, staff logins.
+//   emails              booking emails sent per calendar month (Asia/Manila),
+//                       counted from the email_log table. Auth emails
+//                       (verify / reset) are not counted.
+// Not enforced yet (nothing to enforce): staff logins.
 // ------------------------------------------------------------
 const MB = 1024 * 1024;
 const GB = 1024 * MB;
 
 export const PLAN_LIMITS = {
-  starter: { unit_types: 3, rooms: 10, bookings_per_month: 75, storage_bytes: 50 * MB, custom_fields: 5 },
-  growth: { unit_types: 10, rooms: 40, bookings_per_month: 300, storage_bytes: 250 * MB, custom_fields: 15 },
-  pro: { unit_types: 25, rooms: 100, bookings_per_month: 1000, storage_bytes: 1 * GB, custom_fields: 40 },
+  starter: { unit_types: 3, rooms: 10, bookings_per_month: 75, storage_bytes: 50 * MB, custom_fields: 5, emails: 300 },
+  growth: { unit_types: 10, rooms: 40, bookings_per_month: 300, storage_bytes: 250 * MB, custom_fields: 15, emails: 1000 },
+  pro: { unit_types: 25, rooms: 100, bookings_per_month: 1000, storage_bytes: 1 * GB, custom_fields: 40, emails: 3000 },
 };
 
 // Trials always run on the cheapest plan's limits, whatever plan was picked at signup.
@@ -106,6 +109,7 @@ export async function getUsage(tenantId) {
          from tenant_settings where tenant_id = ${tenantId}) as custom_fields
   `;
   const u = r.rows[0] || {};
+  const emailsThisMonth = await countEmailsThisMonth(tenantId);
   return {
     unit_types: u.unit_types || 0,
     rooms: u.rooms || 0,
@@ -113,7 +117,26 @@ export async function getUsage(tenantId) {
     bookings_this_month: u.bookings_this_month || 0,
     storage_bytes: Number(u.storage_bytes) || 0,
     custom_fields: u.custom_fields || 0,
+    emails_this_month: emailsThisMonth,
   };
+}
+
+// Booking emails actually sent this calendar month (Asia/Manila). Skipped and
+// failed sends are logged too but do not count. Returns 0 if the log can't be
+// read, so a problem here never blocks a booking.
+export async function countEmailsThisMonth(tenantId) {
+  try {
+    const r = await sql`
+      select count(*)::int as n from email_log
+      where tenant_id = ${tenantId}
+        and status = 'sent'
+        and created_at >= (date_trunc('month', now() at time zone 'Asia/Manila') at time zone 'Asia/Manila')
+    `;
+    return r.rows[0].n;
+  } catch (err) {
+    console.error('countEmailsThisMonth failed', err && err.message);
+    return 0;
+  }
 }
 
 export async function countBookingsThisMonth(tenantId) {

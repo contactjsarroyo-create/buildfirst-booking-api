@@ -354,6 +354,34 @@ async function handleStorage(req, res, auth) {
   return res.status(405).json({ ok: false, error: 'Method not allowed' });
 }
 
+// ------------------------------------------------------------
+// Booking-email switches, stored in tenant_settings.email_config.
+//   notify_email     where new-booking alerts go (null = the owner's login email)
+//   owner_new        email the owner when a guest books
+//   guest_received   email the guest right after they book
+//   guest_confirmed  email the guest when the owner confirms
+// ------------------------------------------------------------
+const NOTIFY_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function sanitizeEmailConfig(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    return { config: null, error: 'email_config must be an object' };
+  }
+  const raw = typeof input.notify_email === 'string' ? input.notify_email.trim() : '';
+  if (raw && (raw.length > 200 || !NOTIFY_EMAIL_RE.test(raw))) {
+    return { config: null, error: 'Please enter a valid notification email address' };
+  }
+  return {
+    config: {
+      notify_email: raw || null,
+      owner_new: input.owner_new !== false,
+      guest_received: input.guest_received !== false,
+      guest_confirmed: input.guest_confirmed !== false,
+    },
+    error: null,
+  };
+}
+
 export default async function handler(req, res) {
   if (setCors(req, res, 'GET, PUT, POST, DELETE, OPTIONS')) return;
 
@@ -374,7 +402,7 @@ export default async function handler(req, res) {
                checkin_time::text as checkin_time, checkout_time::text as checkout_time,
                cancellation_policy, deposit_percent, vat_percent,
                min_stay_nights, booking_window_days, theme, payment_channels,
-               custom_fields, widget_template, details_config
+               custom_fields, widget_template, details_config, email_config
         from tenant_settings where tenant_id = ${auth.tenant_id}
       `;
 
@@ -394,6 +422,7 @@ export default async function handler(req, res) {
           custom_fields: usage.custom_fields,
           bookings_this_month: usage.bookings_this_month,
           storage_bytes: usage.storage_bytes,
+          emails_this_month: usage.emails_this_month,
         };
       }
 
@@ -425,6 +454,15 @@ export default async function handler(req, res) {
 
       if (vals.vat_percent < 0 || vals.vat_percent > 100 || vals.deposit_percent < 0 || vals.deposit_percent > 100) {
         return res.status(400).json({ ok: false, error: 'Percentages must be between 0 and 100' });
+      }
+
+      // Booking-email switches. Validated up front so a bad address rejects the
+      // whole save before anything is written.
+      let emailConfigToSave = null;
+      if (Object.prototype.hasOwnProperty.call(b, 'email_config')) {
+        const { config, error } = sanitizeEmailConfig(b.email_config);
+        if (error) return res.status(400).json({ ok: false, error });
+        emailConfigToSave = config;
       }
 
       // ---- public_slug: only touch tenants.public_slug if the request
@@ -552,6 +590,13 @@ export default async function handler(req, res) {
             widget_template = ${widgetTemplateToSave},
             details_config = ${detailsJson}::jsonb,
             updated_at = now()
+          where tenant_id = ${auth.tenant_id}
+        `;
+      }
+
+      if (emailConfigToSave) {
+        await sql`
+          update tenant_settings set email_config = ${JSON.stringify(emailConfigToSave)}::jsonb
           where tenant_id = ${auth.tenant_id}
         `;
       }
