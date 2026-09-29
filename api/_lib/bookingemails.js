@@ -5,17 +5,25 @@
 // fail or lose a booking. Every send is written to the email_log table, and the
 // tenant's monthly plan cap (limits.js, "emails") is counted from that log.
 //
-// Per-tenant switches live in tenant_settings.email_config (jsonb):
-//   { notify_email, owner_new, guest_received, guest_confirmed }
-// A missing key means "on". notify_email overrides the owner's login email.
+// Per-tenant settings live in tenant_settings.email_config (jsonb):
+//   { notify_email, owner_new, guest_received, guest_confirmed, design, templates }
+// A missing switch means "on". notify_email overrides the owner's login email.
+// design + templates hold the resort's own wording and look; anything missing
+// falls back to the defaults in emailcore.js. The details table and the
+// "Powered by Buildfirst" footer are fixed and cannot be edited.
 
 import { sql } from '@vercel/postgres';
 import { sendEmail, appLink } from './email.js';
 import { getAccount, countEmailsThisMonth } from './limits.js';
+import {
+  EMAIL_KINDS,
+  templateFor,
+  fillText,
+  render,
+  oneLine,
+  validEmail,
+} from './emailcore.js';
 
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const HEX_RE = /^#[0-9a-fA-F]{6}$/;
-const DEFAULT_COLOR = '#3b82f6';
 
 // Vercel Hobby kills a function after 10 seconds. The caller waits at most this
 // long for mail so a slow provider can never turn a saved booking into an error.
@@ -46,25 +54,6 @@ export function withTimeout(promise, ms = EMAIL_WAIT_MS) {
 // ------------------------------------------------------------
 // Small helpers
 // ------------------------------------------------------------
-function esc(v) {
-  return String(v === undefined || v === null ? '' : v)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-
-function oneLine(v) {
-  return String(v === undefined || v === null ? '' : v)
-    .replace(/[\r\n]+/g, ' ')
-    .trim();
-}
-
-function validEmail(v) {
-  return typeof v === 'string' && v.length <= 200 && EMAIL_RE.test(v.trim());
-}
-
 function pad(n) {
   return n < 10 ? '0' + n : String(n);
 }
@@ -129,78 +118,6 @@ function channelName(key, channel) {
 }
 
 // ------------------------------------------------------------
-// HTML + plain text rendering
-// ------------------------------------------------------------
-// rows:   [[label, value], ...]      blocks: [{ title, lines: [...] }, ...]
-// Every value is escaped here, so callers pass raw text.
-function render({ brand, color, heading, intro, rows, blocks, button, footer }) {
-  const accent = HEX_RE.test(color || '') ? color : DEFAULT_COLOR;
-
-  const rowsHtml = (rows || [])
-    .filter((r) => r[1] !== undefined && r[1] !== null && String(r[1]) !== '')
-    .map(
-      (r, i) =>
-        `<tr><td style="padding:9px 14px 9px 0;font-size:13px;color:#6b7280;vertical-align:top;width:36%;${i === 0 ? '' : 'border-top:1px solid #eef0f3;'}">${esc(
-          r[0]
-        )}</td><td style="padding:9px 0;font-size:13.5px;font-weight:600;color:#111827;vertical-align:top;${i === 0 ? '' : 'border-top:1px solid #eef0f3;'}">${esc(
-          r[1]
-        ).replace(/\n/g, '<br>')}</td></tr>`
-    )
-    .join('');
-
-  const blocksHtml = (blocks || [])
-    .filter((b) => b && b.lines && b.lines.length)
-    .map(
-      (b) =>
-        `<div style="background:#f7f7fa;border-radius:12px;padding:14px 16px;margin:16px 0 0 0;"><div style="font-size:13px;font-weight:700;color:#111827;margin-bottom:6px;">${esc(
-          b.title
-        )}</div>${b.lines
-          .map((l) => `<div style="font-size:13px;line-height:1.6;color:#374151;">${esc(l).replace(/\n/g, '<br>')}</div>`)
-          .join('')}</div>`
-    )
-    .join('');
-
-  const buttonHtml = button
-    ? `<div style="margin:24px 0 0 0;"><a href="${esc(button.link)}" style="display:inline-block;background:#3b82f6;color:#ffffff;text-decoration:none;font-weight:600;font-size:14px;padding:12px 24px;border-radius:8px;">${esc(
-        button.label
-      )}</a></div>`
-    : '';
-
-  const html = `<!doctype html>
-<html>
-  <body style="margin:0;padding:24px;background:#f4f5f7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;color:#111827;">
-    <div style="max-width:520px;margin:0 auto;background:#ffffff;border-radius:16px;overflow:hidden;">
-      <div style="height:4px;background:${accent};"></div>
-      <div style="padding:28px 32px 32px 32px;">
-        <div style="font-size:12px;font-weight:700;letter-spacing:1.5px;color:#6b7280;text-transform:uppercase;margin-bottom:14px;">${esc(brand)}</div>
-        <h1 style="font-size:20px;line-height:1.3;margin:0 0 10px 0;">${esc(heading)}</h1>
-        <p style="font-size:14px;line-height:1.6;margin:0 0 20px 0;color:#374151;">${esc(intro)}</p>
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">${rowsHtml}</table>
-        ${blocksHtml}
-        ${buttonHtml}
-        <p style="font-size:12px;line-height:1.6;margin:24px 0 0 0;color:#6b7280;">${esc(footer)}</p>
-      </div>
-    </div>
-  </body>
-</html>`;
-
-  const textParts = [heading, '', intro, ''];
-  (rows || [])
-    .filter((r) => r[1] !== undefined && r[1] !== null && String(r[1]) !== '')
-    .forEach((r) => textParts.push(`${r[0]}: ${r[1]}`));
-  (blocks || [])
-    .filter((b) => b && b.lines && b.lines.length)
-    .forEach((b) => {
-      textParts.push('', b.title);
-      b.lines.forEach((l) => textParts.push(l));
-    });
-  if (button) textParts.push('', `${button.label}: ${button.link}`);
-  textParts.push('', footer);
-
-  return { html, text: textParts.join('\n') };
-}
-
-// ------------------------------------------------------------
 // Loading what the emails need. Each lookup is independent and
 // falls back to "nothing", so one missing table or column costs
 // a line in the email, never the whole email.
@@ -222,7 +139,7 @@ async function loadContext(tenantId, booking) {
       async () =>
         (
           await sql`
-            select primary_color, checkin_time::text as checkin_time, checkout_time::text as checkout_time,
+            select primary_color, logo_url, checkin_time::text as checkin_time, checkout_time::text as checkout_time,
                    cancellation_policy, payment_channels, custom_fields, email_config
             from tenant_settings where tenant_id = ${tenantId}
           `
@@ -262,6 +179,7 @@ async function loadContext(tenantId, booking) {
     resort: oneLine(tenant.name) || 'the resort',
     currency: tenant.currency || 'PHP',
     color: settings.primary_color,
+    logoUrl: settings.logo_url || '',
     checkinTime: prettyTime(settings.checkin_time),
     checkoutTime: prettyTime(settings.checkout_time),
     cancellationPolicy: settings.cancellation_policy || '',
@@ -285,7 +203,7 @@ function addonsText(ctx) {
     .join(', ');
 }
 
-function paymentBlock(booking, ctx) {
+function paymentBlock(booking, ctx, title) {
   const key = booking.payment_channel;
   if (!key) return null;
   if (booking.payment_status === 'paid') {
@@ -300,9 +218,10 @@ function paymentBlock(booking, ctx) {
   if (ch && ch.account_number) lines.push(`Account number: ${ch.account_number}`);
   if (ch && ch.instructions) lines.push(ch.instructions);
   if (booking.payment_reference) lines.push(`Your reference: ${booking.payment_reference}`);
-  return { title: 'How to pay', lines };
+  return { title: title || 'How to pay', lines, field: 'payment_title' };
 }
 
+// The fixed details table. Resorts cannot edit these rows.
 function guestRows(booking, ctx) {
   const nights = nightsOf(booking);
   const inTime = ctx.checkinTime ? ` (from ${ctx.checkinTime})` : '';
@@ -323,53 +242,92 @@ function guestRows(booking, ctx) {
   return rows;
 }
 
-function guestBlocks(booking, ctx, { withPayment }) {
-  const blocks = [];
-  if (withPayment) {
-    const pay = paymentBlock(booking, ctx);
-    if (pay) blocks.push(pay);
-  }
-  if (booking.special_requests) {
-    blocks.push({ title: 'Your request', lines: [String(booking.special_requests)] });
-  }
-  if (ctx.cancellationPolicy) {
-    blocks.push({ title: 'Cancellation policy', lines: [String(ctx.cancellationPolicy)] });
-  }
-  return blocks;
-}
-
 function firstName(booking) {
   return oneLine(booking.guest_name).split(' ')[0] || 'there';
 }
 
-function guestFooter(ctx) {
-  return `Questions? Just reply to this email and it will go to ${ctx.resort}. Sent for ${ctx.resort} through Buildfirst.`;
+// Years follow Manila time, like the rest of the app.
+function manilaYear() {
+  return new Date(Date.now() + 8 * 3600 * 1000).getUTCFullYear();
+}
+
+// The words a resort can drop into its texts, like {first_name}.
+function placeholderVars(booking, ctx) {
+  const nights = nightsOf(booking);
+  return {
+    guest_name: oneLine(booking.guest_name),
+    first_name: firstName(booking),
+    resort_name: ctx.resort,
+    reference: shortRef(booking.id),
+    room: ctx.roomType,
+    check_in: prettyDate(booking.check_in),
+    check_out: prettyDate(booking.check_out),
+    nights: nights === null ? '' : nights,
+    guests: booking.guests === undefined || booking.guests === null ? '' : booking.guests,
+    total: money(booking.total_amount, ctx.currency),
+  };
+}
+
+// Colors, logo, sender and reply-to, with the resort's own choices first.
+function designOf(ctx) {
+  const d = ctx.config.design && typeof ctx.config.design === 'object' ? ctx.config.design : {};
+  return {
+    color: d.color || ctx.color,
+    logoUrl: d.show_logo !== false && /^https:\/\/\S+$/.test(ctx.logoUrl || '') ? ctx.logoUrl : '',
+    brand: d.brand_text || ctx.resort,
+    copyright: d.copyright_name || ctx.resort,
+    fromName: oneLine(d.from_name || `${ctx.resort} via Buildfirst`),
+    replyTo: validEmail(d.reply_to) ? d.reply_to.trim() : ctx.ownerTo || undefined,
+  };
+}
+
+function subjectOf(kind, t, vars, ctx) {
+  const fallback = fillText(templateFor(kind, {}).subject, vars);
+  return oneLine(fillText(t.subject, vars)) || oneLine(fallback);
+}
+
+function guestMessage(kind, booking, ctx) {
+  const t = templateFor(kind, ctx.config);
+  const vars = placeholderVars(booking, ctx);
+  const d = designOf(ctx);
+
+  const blocks = [];
+  if (t.show_payment !== false) {
+    const pay = paymentBlock(booking, ctx, oneLine(fillText(t.payment_title, vars)));
+    if (pay) blocks.push(pay);
+  }
+  if (t.show_request !== false && booking.special_requests) {
+    blocks.push({ title: 'Your request', lines: [String(booking.special_requests)] });
+  }
+  if (t.show_policy !== false && ctx.cancellationPolicy) {
+    blocks.push({ title: 'Cancellation policy', lines: [String(ctx.cancellationPolicy)] });
+  }
+
+  const buttonLabel = oneLine(fillText(t.button_label, vars));
+  const button = buttonLabel && /^https?:\/\/\S+$/i.test(t.button_url || '') ? { label: buttonLabel, link: t.button_url } : null;
+
+  const body = render({
+    brand: d.brand,
+    logoUrl: d.logoUrl,
+    color: d.color,
+    heading: oneLine(fillText(t.heading, vars)),
+    intro: fillText(t.intro, vars),
+    rows: guestRows(booking, ctx),
+    blocks,
+    button,
+    closing: fillText(t.closing, vars),
+    copyrightName: d.copyright,
+    year: manilaYear(),
+  });
+  return { subject: subjectOf(kind, t, vars, ctx), ...body };
 }
 
 function guestReceivedMessage(booking, ctx) {
-  const body = render({
-    brand: ctx.resort,
-    color: ctx.color,
-    heading: `Thanks ${firstName(booking)}, we got your booking`,
-    intro: `${ctx.resort} will review it and email you again once it is confirmed. Until then, this is a request and your dates are not guaranteed.`,
-    rows: guestRows(booking, ctx),
-    blocks: guestBlocks(booking, ctx, { withPayment: true }),
-    footer: guestFooter(ctx),
-  });
-  return { subject: oneLine(`We received your booking at ${ctx.resort}`), ...body };
+  return guestMessage('guest_received', booking, ctx);
 }
 
 function guestConfirmedMessage(booking, ctx) {
-  const body = render({
-    brand: ctx.resort,
-    color: ctx.color,
-    heading: `You're booked, ${firstName(booking)}`,
-    intro: `${ctx.resort} has confirmed your booking. Here are your details.`,
-    rows: guestRows(booking, ctx),
-    blocks: guestBlocks(booking, ctx, { withPayment: true }),
-    footer: guestFooter(ctx),
-  });
-  return { subject: oneLine(`Your booking at ${ctx.resort} is confirmed`), ...body };
+  return guestMessage('guest_confirmed', booking, ctx);
 }
 
 function ownerAnswers(booking, ctx) {
@@ -389,6 +347,9 @@ function ownerAnswers(booking, ctx) {
 }
 
 function ownerNewBookingMessage(booking, ctx) {
+  const t = templateFor('owner_new', ctx.config);
+  const vars = placeholderVars(booking, ctx);
+  const d = designOf(ctx);
   const nights = nightsOf(booking);
   const room = ctx.roomLabel ? `${ctx.roomType} (${ctx.roomLabel})` : ctx.roomType;
   const ch = booking.payment_channel ? ctx.channels[booking.payment_channel] : null;
@@ -409,17 +370,21 @@ function ownerNewBookingMessage(booking, ctx) {
     ...ownerAnswers(booking, ctx),
     ['Booking reference', shortRef(booking.id)],
   ];
+  const buttonLabel = oneLine(fillText(t.button_label, vars));
   const body = render({
     brand: 'Buildfirst',
-    color: ctx.color,
-    heading: `New booking from ${oneLine(booking.guest_name)}`,
-    intro: `${ctx.resort} has a new booking. It is pending until you confirm it in your dashboard.`,
+    logoUrl: '',
+    color: d.color,
+    heading: oneLine(fillText(t.heading, vars)),
+    intro: fillText(t.intro, vars),
     rows,
     blocks: [],
-    button: { label: 'Open dashboard', link: appLink({}) },
-    footer: 'Reply to this email to write to the guest directly. You can turn these alerts off or change where they go under Account Settings.',
+    button: buttonLabel ? { label: buttonLabel, link: appLink({}) } : null,
+    closing: fillText(t.closing, vars),
+    copyrightName: d.copyright,
+    year: manilaYear(),
   });
-  return { subject: oneLine(`New booking: ${booking.guest_name} (${ymd(booking.check_in)} to ${ymd(booking.check_out)})`), ...body };
+  return { subject: subjectOf('owner_new', t, vars, ctx), ...body };
 }
 
 // ------------------------------------------------------------
@@ -500,8 +465,8 @@ export async function sendBookingCreatedEmails(tenantId, booking, accountIn) {
         kind: 'guest_received',
         to: booking.guest_email.trim(),
         message: guestReceivedMessage(booking, ctx),
-        fromName: `${ctx.resort} via Buildfirst`,
-        replyTo: ctx.ownerTo || undefined,
+        fromName: designOf(ctx).fromName,
+        replyTo: designOf(ctx).replyTo,
       });
     }
     if (jobs.length === 0) return;
@@ -539,8 +504,8 @@ export async function sendBookingConfirmedEmail(tenantId, bookingId) {
         kind: 'guest_confirmed',
         to: booking.guest_email.trim(),
         message: guestConfirmedMessage(booking, ctx),
-        fromName: `${ctx.resort} via Buildfirst`,
-        replyTo: ctx.ownerTo || undefined,
+        fromName: designOf(ctx).fromName,
+        replyTo: designOf(ctx).replyTo,
       },
     ]);
     if (sent === 0) {
@@ -553,5 +518,71 @@ export async function sendBookingConfirmedEmail(tenantId, bookingId) {
   } catch (err) {
     console.error('bookingEmails: confirmed email failed', err && err.message);
     return false;
+  }
+}
+
+// ------------------------------------------------------------
+// "Send me a test": the editor's unsaved settings, a made-up booking, sent to
+// an address the owner types. Counts against the monthly cap like any email.
+// ------------------------------------------------------------
+function sampleBooking(guestEmail) {
+  return {
+    id: 'c1621bee-0000-4000-8000-000000000000',
+    guest_name: 'Maria Santos',
+    guest_email: guestEmail,
+    guest_phone: '0917 123 4567',
+    check_in: '2026-09-29',
+    check_out: '2026-09-30',
+    nights: 1,
+    guests: 2,
+    total_amount: 2800,
+    payment_channel: 'custom_sample',
+    payment_reference: 'GC-48213',
+    payment_status: 'pending',
+    special_requests: 'Arriving late, around 9 PM.',
+  };
+}
+
+export async function sendTestEmail(tenantId, kind, to, configIn) {
+  try {
+    if (!EMAIL_KINDS.includes(kind)) return { ok: false, error: 'Unknown email type' };
+    if (!validEmail(to)) return { ok: false, error: 'Enter a valid email address to send the test to' };
+    const account = await getAccount(tenantId);
+    if (!account) return { ok: false, error: 'Account not found' };
+
+    const booking = sampleBooking(to.trim());
+    const ctx = await loadContext(tenantId, booking);
+    if (configIn && typeof configIn === 'object') ctx.config = configIn;
+    ctx.roomType = 'Standard Room';
+    ctx.roomLabel = '';
+    ctx.addons = [];
+    ctx.channels = {
+      custom_sample: {
+        name: 'GCash',
+        account_name: 'Juan Dela Cruz',
+        account_number: '0917 000 0000',
+        instructions: 'Send the full amount and keep your receipt.',
+      },
+    };
+
+    const message = kind === 'owner_new' ? ownerNewBookingMessage(booking, ctx) : guestMessage(kind, booking, ctx);
+    message.subject = `[Test] ${message.subject}`;
+    const d = designOf(ctx);
+    const sent = await sendJobs(tenantId, account, [
+      {
+        kind: 'test',
+        to: to.trim(),
+        message,
+        fromName: kind === 'owner_new' ? undefined : d.fromName,
+        replyTo: kind === 'owner_new' ? undefined : d.replyTo,
+      },
+    ]);
+    if (sent === 0) {
+      return { ok: false, error: 'The test email could not be sent. Your monthly email limit may be used up, or the email service is not responding.' };
+    }
+    return { ok: true };
+  } catch (err) {
+    console.error('bookingEmails: test email failed', err && err.message);
+    return { ok: false, error: 'The test email could not be sent right now.' };
   }
 }

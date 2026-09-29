@@ -23,6 +23,8 @@ import {
   storageBreakdown,
   listFiles,
 } from './_lib/storage.js';
+import { sanitizeEmailConfig, EMAIL_DEFAULTS, PLACEHOLDERS } from './_lib/emailcore.js';
+import { sendTestEmail } from './_lib/bookingemails.js';
 
 const HEX_RE = /^#[0-9a-fA-F]{6}$/;
 const FONT_WHITELIST = [
@@ -355,31 +357,65 @@ async function handleStorage(req, res, auth) {
 }
 
 // ------------------------------------------------------------
-// Booking-email switches, stored in tenant_settings.email_config.
-//   notify_email     where new-booking alerts go (null = the owner's login email)
-//   owner_new        email the owner when a guest books
-//   guest_received   email the guest right after they book
-//   guest_confirmed  email the guest when the owner confirms
+// Booking emails: the on/off switches, where owner alerts go, and the
+// resort's own wording and look, all stored in tenant_settings.email_config.
+// Reached via /api/settings?resource=emails (merged here to stay under
+// Vercel's 12-function cap). It never touches any other setting.
+//   GET   current config + the defaults + numbers for the editor
+//   PUT   { email_config }
+//   POST  { email_config, kind, to }   sends a test email from unsaved edits
+// The cleaning rules live in _lib/emailcore.js.
 // ------------------------------------------------------------
-const NOTIFY_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+async function handleEmails(req, res, auth) {
+  if (req.method === 'GET') {
+    const t = await sql`select name from tenants where id = ${auth.tenant_id}`;
+    const s = await sql`select logo_url, primary_color, email_config from tenant_settings where tenant_id = ${auth.tenant_id}`;
+    const owner = await sql`select email from tenant_users where tenant_id = ${auth.tenant_id} limit 1`;
+    const account = await getAccount(auth.tenant_id);
+    let emailsUsed = null;
+    if (account) {
+      const usage = await getUsage(auth.tenant_id);
+      emailsUsed = usage.emails_this_month;
+    }
+    const row = s.rows[0] || {};
+    return res.status(200).json({
+      ok: true,
+      resort_name: (t.rows[0] && t.rows[0].name) || '',
+      logo_url: row.logo_url || '',
+      primary_color: row.primary_color || '',
+      owner_email: (owner.rows[0] && owner.rows[0].email) || '',
+      config: row.email_config && typeof row.email_config === 'object' ? row.email_config : {},
+      defaults: EMAIL_DEFAULTS,
+      placeholders: PLACEHOLDERS,
+      emails_used: emailsUsed,
+      emails_limit: account && account.limits ? account.limits.emails : null,
+      has_settings: !!s.rows[0],
+    });
+  }
 
-function sanitizeEmailConfig(input) {
-  if (!input || typeof input !== 'object' || Array.isArray(input)) {
-    return { config: null, error: 'email_config must be an object' };
+  if (req.method === 'PUT' || req.method === 'POST') {
+    const b = req.body || {};
+    const { config, error } = sanitizeEmailConfig(b.email_config);
+    if (error) return res.status(400).json({ ok: false, error });
+
+    if (req.method === 'POST') {
+      const result = await sendTestEmail(auth.tenant_id, String(b.kind || ''), String(b.to || ''), config);
+      if (!result.ok) return res.status(400).json({ ok: false, error: result.error });
+      return res.status(200).json({ ok: true });
+    }
+
+    const saved = await sql`
+      update tenant_settings set email_config = ${JSON.stringify(config)}::jsonb, updated_at = now()
+      where tenant_id = ${auth.tenant_id}
+      returning tenant_id
+    `;
+    if (saved.rows.length === 0) {
+      return res.status(404).json({ ok: false, error: 'Save your account settings once first, then try again.' });
+    }
+    return res.status(200).json({ ok: true, config });
   }
-  const raw = typeof input.notify_email === 'string' ? input.notify_email.trim() : '';
-  if (raw && (raw.length > 200 || !NOTIFY_EMAIL_RE.test(raw))) {
-    return { config: null, error: 'Please enter a valid notification email address' };
-  }
-  return {
-    config: {
-      notify_email: raw || null,
-      owner_new: input.owner_new !== false,
-      guest_received: input.guest_received !== false,
-      guest_confirmed: input.guest_confirmed !== false,
-    },
-    error: null,
-  };
+
+  return res.status(405).json({ ok: false, error: 'Method not allowed' });
 }
 
 export default async function handler(req, res) {
@@ -391,6 +427,9 @@ export default async function handler(req, res) {
   try {
     if (req.query && req.query.resource === 'storage') {
       return await handleStorage(req, res, auth);
+    }
+    if (req.query && req.query.resource === 'emails') {
+      return await handleEmails(req, res, auth);
     }
 
     if (req.method === 'GET') {
@@ -454,15 +493,6 @@ export default async function handler(req, res) {
 
       if (vals.vat_percent < 0 || vals.vat_percent > 100 || vals.deposit_percent < 0 || vals.deposit_percent > 100) {
         return res.status(400).json({ ok: false, error: 'Percentages must be between 0 and 100' });
-      }
-
-      // Booking-email switches. Validated up front so a bad address rejects the
-      // whole save before anything is written.
-      let emailConfigToSave = null;
-      if (Object.prototype.hasOwnProperty.call(b, 'email_config')) {
-        const { config, error } = sanitizeEmailConfig(b.email_config);
-        if (error) return res.status(400).json({ ok: false, error });
-        emailConfigToSave = config;
       }
 
       // ---- public_slug: only touch tenants.public_slug if the request
@@ -594,12 +624,6 @@ export default async function handler(req, res) {
         `;
       }
 
-      if (emailConfigToSave) {
-        await sql`
-          update tenant_settings set email_config = ${JSON.stringify(emailConfigToSave)}::jsonb
-          where tenant_id = ${auth.tenant_id}
-        `;
-      }
       return res.status(200).json({ ok: true });
     }
 
