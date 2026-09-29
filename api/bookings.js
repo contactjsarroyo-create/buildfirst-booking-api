@@ -3,6 +3,7 @@ import { put } from '@vercel/blob';
 import { setCors, getAuth } from './_lib/helpers.js';
 import { computeQuote } from './_lib/pricing.js';
 import { getAccount, countBookingsThisMonth, reserveStorage, releaseStorage } from './_lib/limits.js';
+import { recordFileOrRollback, linkFilesToBooking } from './_lib/storage.js';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -97,6 +98,9 @@ async function handleGuestImageUpload(req, res) {
     await releaseStorage(b.tenant_id, size);
     throw err;
   }
+  // Track the file so the owner can see/delete it and the daily cleanup can
+  // expire it. It gets tied to its booking when the booking is submitted.
+  await recordFileOrRollback(b.tenant_id, 'guest_upload', blob.url, size);
   return res.status(200).json({ ok: true, url: blob.url });
 }
 
@@ -314,6 +318,22 @@ export default async function handler(req, res) {
         RETURNING *
       `;
       const booking = result.rows[0];
+
+      // Tie any guest photos in this booking to it (used for the retention
+      // clock). Best effort: a failure here must never lose the booking.
+      try {
+        const photoKeys = (Array.isArray(customFields) ? customFields : [])
+          .filter((f) => f && f.type === 'image_upload')
+          .map((f) => f.key);
+        const photoUrls = photoKeys
+          .map((k) => customFieldResponses[k])
+          .filter((u) => typeof u === 'string' && u);
+        if (photoUrls.length > 0) {
+          await linkFilesToBooking(b.tenant_id, booking.id, photoUrls);
+        }
+      } catch (linkErr) {
+        console.error(linkErr);
+      }
 
       for (const addon of q.valid_addons) {
         await sql`

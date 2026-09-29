@@ -11,6 +11,18 @@ import {
   releaseStorage,
   formatBytes,
 } from './_lib/limits.js';
+import {
+  RETENTION_OPTIONS,
+  NOTICE_DAYS,
+  isUuid,
+  recordFileOrRollback,
+  removeTenantFiles,
+  getRetention,
+  setRetention,
+  expiringSoonCount,
+  storageBreakdown,
+  listFiles,
+} from './_lib/storage.js';
 
 const HEX_RE = /^#[0-9a-fA-F]{6}$/;
 const FONT_WHITELIST = [
@@ -272,13 +284,87 @@ function parseImageDataUrl(input) {
   return { mime, buffer };
 }
 
+// ------------------------------------------------------------
+// Storage: usage meter, file list, deleting files, and the guest-photo
+// auto-cleanup setting. Reached via /api/settings?resource=storage
+// (merged here to stay under Vercel's 12-function Hobby cap).
+//   GET     usage + files (add &summary=1 for just the numbers)
+//   DELETE  &id=<file id>  or  &ids=<id>,<id>,...  (max 50)
+//   PUT     { image_retention_days }  7, 14, 30, 60, 90, or 0 = never
+// Deleting is allowed even when the trial has ended, so an owner can
+// always free up space.
+// ------------------------------------------------------------
+async function handleStorage(req, res, auth) {
+  const account = await getAccount(auth.tenant_id);
+  if (!account) return res.status(404).json({ ok: false, error: 'Account not found' });
+
+  if (req.method === 'GET') {
+    const [retention, expiring] = await Promise.all([
+      getRetention(auth.tenant_id),
+      expiringSoonCount(auth.tenant_id),
+    ]);
+    const out = {
+      ok: true,
+      used_bytes: account.storage_bytes,
+      limit_bytes: account.limits.storage_bytes,
+      plan_label: account.label,
+      retention_days: retention,
+      retention_options: RETENTION_OPTIONS,
+      expiring_soon: expiring,
+      notice_days: NOTICE_DAYS,
+    };
+    if (req.query.summary === '1') return res.status(200).json(out);
+    out.breakdown = await storageBreakdown(auth.tenant_id);
+    out.files = await listFiles(auth.tenant_id);
+    return res.status(200).json(out);
+  }
+
+  if (req.method === 'DELETE') {
+    const raw = String(req.query.ids || req.query.id || '');
+    const ids = raw.split(',').map((x) => x.trim()).filter(Boolean);
+    if (ids.length === 0 || ids.length > 50 || !ids.every(isUuid)) {
+      return res.status(400).json({ ok: false, error: 'Choose between 1 and 50 files to delete' });
+    }
+    let deleted;
+    try {
+      deleted = await removeTenantFiles(auth.tenant_id, ids);
+    } catch (err) {
+      console.error(err);
+      return res.status(500).json({ ok: false, error: 'Could not delete right now. Nothing was changed, please try again.' });
+    }
+    const after = await getAccount(auth.tenant_id);
+    return res.status(200).json({ ok: true, deleted, used_bytes: after ? after.storage_bytes : 0 });
+  }
+
+  if (req.method === 'PUT') {
+    const days = Number((req.body || {}).image_retention_days);
+    if (!RETENTION_OPTIONS.includes(days)) {
+      return res.status(400).json({
+        ok: false,
+        error: `image_retention_days must be one of: ${RETENTION_OPTIONS.join(', ')} (0 = never delete)`,
+      });
+    }
+    const saved = await setRetention(auth.tenant_id, days);
+    if (!saved) {
+      return res.status(404).json({ ok: false, error: 'Save your account settings once first, then try again.' });
+    }
+    return res.status(200).json({ ok: true, retention_days: days });
+  }
+
+  return res.status(405).json({ ok: false, error: 'Method not allowed' });
+}
+
 export default async function handler(req, res) {
-  if (setCors(req, res, 'GET, PUT, POST, OPTIONS')) return;
+  if (setCors(req, res, 'GET, PUT, POST, DELETE, OPTIONS')) return;
 
   const auth = getAuth(req);
   if (!auth) return res.status(401).json({ ok: false, error: 'Unauthorized' });
 
   try {
+    if (req.query && req.query.resource === 'storage') {
+      return await handleStorage(req, res, auth);
+    }
+
     if (req.method === 'GET') {
       const t = await sql`
         select name, slug, public_slug, plan, currency from tenants where id = ${auth.tenant_id}
@@ -512,6 +598,7 @@ export default async function handler(req, res) {
         await releaseStorage(auth.tenant_id, size);
         throw err;
       }
+      await recordFileOrRollback(auth.tenant_id, 'question_image', blob.url, size);
       return res.status(200).json({ ok: true, url: blob.url });
     }
 
