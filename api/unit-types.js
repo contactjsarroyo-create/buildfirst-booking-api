@@ -2,6 +2,43 @@ import { sql } from '@vercel/postgres';
 import { setCors, getAuth, num, text } from './_lib/helpers.js';
 import { getAccount, getUsage, planLimit } from './_lib/limits.js';
 
+
+// Short room code from a room type's name: "Standard Room" -> SR, "Deluxe
+// Ocean Suite" -> DOS. A single word uses its first two letters ("Villa" ->
+// VI). Numbers keep counting up per code across the whole account, so codes
+// never repeat (SR01, SR02, ... even if two types share the same letters).
+function roomPrefix(name) {
+  const words = String(name || '')
+    .replace(/[^A-Za-z0-9 ]+/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter((w) => w && !/^\d+$/.test(w));
+  let p = '';
+  if (words.length >= 2) p = words.slice(0, 4).map((w) => w[0]).join('');
+  else if (words.length === 1) p = words[0].slice(0, 2);
+  p = p.toUpperCase();
+  return p || 'RM';
+}
+
+async function createRoomsForType(tenantId, unitTypeId, name, count) {
+  if (!count || count < 1) return;
+  const prefix = roomPrefix(name);
+  const existing = await sql`select label from rooms where tenant_id = ${tenantId}`;
+  const re = new RegExp('^' + prefix + '(\\d+)$');
+  let max = 0;
+  for (const row of existing.rows) {
+    const m = re.exec(row.label || '');
+    if (m) max = Math.max(max, parseInt(m[1], 10));
+  }
+  for (let i = 1; i <= count; i++) {
+    const label = prefix + String(max + i).padStart(2, '0');
+    await sql`
+      insert into rooms (tenant_id, unit_type_id, label)
+      values (${tenantId}, ${unitTypeId}, ${label})
+    `;
+  }
+}
+
 export default async function handler(req, res) {
   if (setCors(req, res, 'GET, POST, PUT, OPTIONS')) return;
 
@@ -83,7 +120,18 @@ export default async function handler(req, res) {
           values (${auth.tenant_id}, ${name}, ${description}, ${capacity}::integer, ${rate}::numeric, ${newCount}::integer, ${active}::boolean)
           returning id
         `;
-        return res.status(200).json({ ok: true, id: result.rows[0].id });
+        const newId = result.rows[0].id;
+        // Create the individual rooms (SR01, SR02, ...) to match the count.
+        // If that fails, remove the half-made room type so nothing is left over.
+        try {
+          await createRoomsForType(auth.tenant_id, newId, name, newCount);
+        } catch (roomErr) {
+          console.error(roomErr);
+          await sql`delete from rooms where unit_type_id = ${newId} and tenant_id = ${auth.tenant_id}`;
+          await sql`delete from unit_types where id = ${newId} and tenant_id = ${auth.tenant_id}`;
+          return res.status(500).json({ ok: false, error: 'Could not create the rooms for this room type' });
+        }
+        return res.status(200).json({ ok: true, id: newId, rooms_created: newCount });
       }
 
       if (!b.id) return res.status(400).json({ ok: false, error: 'id is required' });

@@ -11,7 +11,7 @@ export default async function handler(req, res) {
   if (!auth) return res.status(401).json({ ok: false, error: 'Unauthorized' });
 
   try {
-    const { id, status, mark_paid, archived } = req.body || {};
+    const { id, status, mark_paid, archived, seen } = req.body || {};
     const allowedStatus = ['pending', 'confirmed', 'cancelled'];
 
     if (!id) {
@@ -23,8 +23,11 @@ export default async function handler(req, res) {
     if (archived !== undefined && typeof archived !== 'boolean') {
       return res.status(400).json({ ok: false, error: 'archived must be true or false' });
     }
-    if (status === undefined && !mark_paid && archived === undefined) {
-      return res.status(400).json({ ok: false, error: 'Provide a status, mark_paid, and/or archived' });
+    if (seen !== undefined && typeof seen !== 'boolean') {
+      return res.status(400).json({ ok: false, error: 'seen must be true or false' });
+    }
+    if (status === undefined && !mark_paid && archived === undefined && seen === undefined) {
+      return res.status(400).json({ ok: false, error: 'Provide a status, mark_paid, archived, and/or seen' });
     }
 
     // Status/payment updates first (unchanged logic), archiving is a separate
@@ -70,8 +73,27 @@ export default async function handler(req, res) {
       }
     }
 
+    // "Seen" is its own flag too: it records that the owner has looked at a
+    // booking and never touches status, payment or archive state.
+    if (seen !== undefined) {
+      const seenResult = seen
+        ? await sql`
+            update bookings set seen_at = coalesce(seen_at, now())
+            where id = ${id} and tenant_id = ${auth.tenant_id}
+            returning id
+          `
+        : await sql`
+            update bookings set seen_at = null
+            where id = ${id} and tenant_id = ${auth.tenant_id}
+            returning id
+          `;
+      if (seenResult.rows.length === 0) {
+        return res.status(404).json({ ok: false, error: 'Booking not found' });
+      }
+    }
+
     const final = await sql`
-      select id, status, payment_status, payment_confirmed_at, is_archived
+      select id, status, payment_status, payment_confirmed_at, is_archived, seen_at
       from bookings
       where id = ${id} and tenant_id = ${auth.tenant_id}
     `;
