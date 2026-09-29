@@ -267,12 +267,21 @@ export default async function handler(req, res) {
       // Confirm the tenant actually has this channel enabled before accepting the booking,
       // and grab custom_fields in the same query so we can validate the guest's answers.
       const settingsResult = await sql`
-        SELECT payment_channels, custom_fields FROM tenant_settings WHERE tenant_id = ${b.tenant_id}
+        SELECT payment_channels, custom_fields, details_config FROM tenant_settings WHERE tenant_id = ${b.tenant_id}
       `;
       const channels = settingsResult.rows[0] ? settingsResult.rows[0].payment_channels : null;
       const channelConfig = channels ? channels[payment_channel] : null;
       if (!channelConfig || channelConfig.enabled !== true) {
         return res.status(400).json({ ok: false, error: 'That payment method is not available for this resort' });
+      }
+
+      // The resort can make the payment reference required (or hide it) from the
+      // booking form editor. PayMongo never asks for one.
+      const formConfig =
+        settingsResult.rows[0] && settingsResult.rows[0].details_config ? settingsResult.rows[0].details_config : {};
+      if (payment_channel !== 'paymongo' && formConfig.reference_mode === 'required' && !payment_reference) {
+        const referenceLabel = formConfig.reference_label || 'Payment reference';
+        return res.status(400).json({ ok: false, error: `"${referenceLabel}" is required` });
       }
 
       const customFields = settingsResult.rows[0] ? settingsResult.rows[0].custom_fields : [];

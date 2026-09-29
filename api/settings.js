@@ -208,8 +208,17 @@ function sanitizeCustomFields(input) {
 // Unknown keys are dropped; blank labels fall back to the widget defaults.
 // ------------------------------------------------------------
 const DETAILS_MODES = ['hidden', 'optional', 'required'];
-const DETAILS_LABEL_KEYS = ['title', 'name_label', 'email_label', 'phone_label', 'requests_label'];
-const DETAILS_MODE_KEYS = ['phone_mode', 'requests_mode'];
+const DETAILS_LABEL_KEYS = [
+  'title', 'name_label', 'email_label', 'phone_label', 'requests_label',
+  'dates_title', 'guests_label', 'rooms_title', 'addons_title', 'promo_label',
+  'payment_title', 'reference_label', 'reference_placeholder', 'policy_label',
+];
+const DETAILS_MODE_KEYS = ['phone_mode', 'requests_mode', 'reference_mode'];
+// Order of the form's sections. Each custom question is a repeated "q" token
+// (the Nth "q" is the Nth entry of custom_fields). The widget fills in any
+// section that is missing, so a bad list can never hide part of the form.
+const SECTION_ORDER_TOKENS = ['dates', 'guests', 'rooms', 'extras', 'details', 'q', 'payment', 'policy'];
+const MAX_SECTION_ORDER = 60;
 
 function sanitizeDetailsConfig(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return {};
@@ -220,6 +229,12 @@ function sanitizeDetailsConfig(input) {
   }
   for (const key of DETAILS_MODE_KEYS) {
     if (DETAILS_MODES.includes(input[key])) out[key] = input[key];
+  }
+  if (Array.isArray(input.section_order)) {
+    const order = input.section_order
+      .filter((t) => typeof t === 'string' && SECTION_ORDER_TOKENS.includes(t))
+      .slice(0, MAX_SECTION_ORDER);
+    if (order.length > 0) out.section_order = order;
   }
   return out;
 }
