@@ -146,7 +146,7 @@ async function loadContext(tenantId, booking) {
         ).rows[0] || {},
       {}
     ),
-    safe('owner', async () => (await sql`select email from tenant_users where tenant_id = ${tenantId} limit 1`).rows[0] || {}, {}),
+    safe('owner', async () => (await sql`select email from tenant_users where tenant_id = ${tenantId} and role is distinct from 'staff' limit 1`).rows[0] || {}, {}),
     booking.unit_type_id
       ? safe(
           'room type',
