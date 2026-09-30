@@ -188,10 +188,12 @@ export default async function handler(req, res) {
       return res.status(404).json({ ok: false, error: 'Booking not found' });
     }
 
-    // When the owner confirms a booking, email the guest once. Best effort:
+    // Email the guest their confirmation once, when the owner confirms the
+    // booking OR marks it as paid. sendBookingConfirmedEmail only sends for a
+    // confirmed booking and never twice (confirmed_email_sent_at). Best effort:
     // never fails the update, and waits only a few seconds.
     let guestEmailed = false;
-    if (status === 'confirmed') {
+    if (status === 'confirmed' || mark_paid) {
       guestEmailed = (await withTimeout(sendBookingConfirmedEmail(auth.tenant_id, id))) === true;
     }
 
