@@ -1,6 +1,8 @@
 import { sql } from '@vercel/postgres';
+import { put } from '@vercel/blob';
 import { setCors, getAuth, num, text } from './_lib/helpers.js';
-import { getAccount, getUsage, planLimit } from './_lib/limits.js';
+import { getAccount, getUsage, planLimit, reserveStorage, releaseStorage } from './_lib/limits.js';
+import { recordFileOrRollback, removeFiles, isUuid } from './_lib/storage.js';
 
 
 // Short room code from a room type's name: "Standard Room" -> SR, "Deluxe
@@ -40,16 +42,20 @@ async function createRoomsForType(tenantId, unitTypeId, name, count) {
 }
 
 export default async function handler(req, res) {
-  if (setCors(req, res, 'GET, POST, PUT, OPTIONS')) return;
+  if (setCors(req, res, 'GET, POST, PUT, DELETE, OPTIONS')) return;
 
   const auth = getAuth(req);
   if (!auth) return res.status(401).json({ ok: false, error: 'Unauthorized' });
 
-  const resource = req.query && req.query.resource === 'rooms' ? 'rooms' : 'unit_types';
+  const rq = req.query && req.query.resource;
+  const resource = rq === 'rooms' ? 'rooms' : rq === 'photos' ? 'photos' : 'unit_types';
 
   try {
     if (resource === 'rooms') {
       return await handleRooms(req, res, auth);
+    }
+    if (resource === 'photos') {
+      return await handlePhotos(req, res, auth);
     }
 
     if (req.method === 'GET') {
@@ -72,9 +78,23 @@ export default async function handler(req, res) {
         if (!roomsByType[r.unit_type_id]) roomsByType[r.unit_type_id] = [];
         roomsByType[r.unit_type_id].push(r);
       }
+      // Room photos, in the order the owner arranged them.
+      const photosResult = await sql`
+        select p.id, p.unit_type_id, p.url
+        from unit_type_photos p
+        join unit_types u on u.id = p.unit_type_id
+        where u.tenant_id = ${auth.tenant_id}
+        order by p.display_order, p.id
+      `;
+      const photosByType = {};
+      for (const p of photosResult.rows) {
+        if (!photosByType[p.unit_type_id]) photosByType[p.unit_type_id] = [];
+        photosByType[p.unit_type_id].push({ id: p.id, url: p.url });
+      }
       const unit_types = typesResult.rows.map((t) => ({
         ...t,
         rooms: roomsByType[t.id] || [],
+        photos: photosByType[t.id] || [],
       }));
       return res.status(200).json({ ok: true, unit_types });
     }
@@ -234,6 +254,149 @@ async function handleRooms(req, res, auth) {
     `;
     if (result.rows.length === 0) return res.status(404).json({ ok: false, error: 'Not found' });
     return res.status(200).json({ ok: true, id: result.rows[0].id });
+  }
+
+  return res.status(405).json({ ok: false, error: 'Method not allowed' });
+}
+
+// ------------------------------------------------------------
+// Room photos, reached via /api/unit-types?resource=photos
+//   POST   { unit_type_id, image_base64 }   add a photo (data URL, jpg/png/webp, 4MB)
+//   PUT    { unit_type_id, ids: [photoId, ...] }   save a new order (first = cover photo)
+//   DELETE ?id=<photoId>                     remove a photo completely
+// Each photo is tracked in uploaded_files (kind 'room_photo') so it counts
+// toward the plan's storage limit and shows in the Storage tab. Room photos
+// are never auto-deleted; the owner removes them. The photo list itself
+// (order) lives in unit_type_photos. Merged here to stay under the
+// 12-function cap.
+// ------------------------------------------------------------
+const MAX_PHOTOS_PER_TYPE = 8;
+const PHOTO_TYPES = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' };
+const MAX_PHOTO_BYTES = 4 * 1024 * 1024;
+
+function parsePhotoDataUrl(input) {
+  if (typeof input !== 'string') return null;
+  const match = /^data:(image\/(?:jpeg|png|webp));base64,(.+)$/.exec(input.trim());
+  if (!match) return null;
+  return { mime: match[1], buffer: Buffer.from(match[2], 'base64') };
+}
+
+async function handlePhotos(req, res, auth) {
+  if (req.method === 'POST') {
+    const b = req.body || {};
+    const unitTypeId = text(b.unit_type_id);
+    if (!unitTypeId || !isUuid(unitTypeId)) {
+      return res.status(400).json({ ok: false, error: 'unit_type_id is required' });
+    }
+    const typeCheck = await sql`
+      select id from unit_types where id = ${unitTypeId} and tenant_id = ${auth.tenant_id}
+    `;
+    if (typeCheck.rows.length === 0) {
+      return res.status(404).json({ ok: false, error: 'Room type not found' });
+    }
+
+    const account = await getAccount(auth.tenant_id);
+    if (!account) return res.status(404).json({ ok: false, error: 'Account not found' });
+
+    const parsed = parsePhotoDataUrl(b.image_base64);
+    if (!parsed) {
+      return res.status(400).json({ ok: false, error: 'Please choose a JPG, PNG or WEBP image' });
+    }
+    if (parsed.buffer.length > MAX_PHOTO_BYTES) {
+      return res.status(400).json({ ok: false, error: 'That photo is too big. Please use one under 4MB.' });
+    }
+
+    const countResult = await sql`
+      select count(*)::int as n, coalesce(max(display_order), -1)::int as top
+      from unit_type_photos where unit_type_id = ${unitTypeId}
+    `;
+    if (countResult.rows[0].n >= MAX_PHOTOS_PER_TYPE) {
+      return res.status(400).json({
+        ok: false,
+        error: `You can add up to ${MAX_PHOTOS_PER_TYPE} photos per room type. Remove one to add another.`,
+      });
+    }
+
+    const size = parsed.buffer.length;
+    const reserved = await reserveStorage(auth.tenant_id, size, account.limits.storage_bytes);
+    if (!reserved) {
+      return planLimit(
+        res,
+        account,
+        `Your ${account.label} photo storage is full. Delete some photos in the Storage tab or upgrade your plan.`,
+        'storage'
+      );
+    }
+
+    const ext = PHOTO_TYPES[parsed.mime];
+    const pathname = `room-photos/${auth.tenant_id}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    let blob;
+    try {
+      blob = await put(pathname, parsed.buffer, { access: 'public', contentType: parsed.mime });
+    } catch (err) {
+      await releaseStorage(auth.tenant_id, size);
+      throw err;
+    }
+    await recordFileOrRollback(auth.tenant_id, 'room_photo', blob.url, size);
+
+    const inserted = await sql`
+      insert into unit_type_photos (unit_type_id, url, display_order)
+      values (${unitTypeId}, ${blob.url}, ${countResult.rows[0].top + 1}::integer)
+      returning id
+    `;
+    return res.status(200).json({ ok: true, id: inserted.rows[0].id, url: blob.url });
+  }
+
+  if (req.method === 'PUT') {
+    const b = req.body || {};
+    const unitTypeId = text(b.unit_type_id);
+    const ids = Array.isArray(b.ids) ? b.ids.map((x) => String(x)) : [];
+    if (!unitTypeId || !isUuid(unitTypeId) || ids.length === 0 || !ids.every(isUuid)) {
+      return res.status(400).json({ ok: false, error: 'unit_type_id and ids are required' });
+    }
+    const typeCheck = await sql`
+      select id from unit_types where id = ${unitTypeId} and tenant_id = ${auth.tenant_id}
+    `;
+    if (typeCheck.rows.length === 0) {
+      return res.status(404).json({ ok: false, error: 'Room type not found' });
+    }
+    for (let i = 0; i < ids.length; i++) {
+      await sql`
+        update unit_type_photos set display_order = ${i}::integer
+        where id = ${ids[i]} and unit_type_id = ${unitTypeId}
+      `;
+    }
+    return res.status(200).json({ ok: true });
+  }
+
+  if (req.method === 'DELETE') {
+    const id = text(req.query && req.query.id);
+    if (!id || !isUuid(id)) return res.status(400).json({ ok: false, error: 'id is required' });
+
+    const found = await sql`
+      select p.id, p.url from unit_type_photos p
+      join unit_types u on u.id = p.unit_type_id
+      where p.id = ${id} and u.tenant_id = ${auth.tenant_id}
+    `;
+    if (found.rows.length === 0) return res.status(404).json({ ok: false, error: 'Photo not found' });
+    const url = found.rows[0].url;
+
+    const file = await sql`
+      select id, tenant_id, url, bytes::float8 as bytes from uploaded_files
+      where tenant_id = ${auth.tenant_id} and kind = 'room_photo' and url = ${url}
+    `;
+    try {
+      if (file.rows.length > 0) {
+        // Removes the image, the photo row, the tracking row and the bytes.
+        await removeFiles(file.rows);
+      } else {
+        await sql`delete from unit_type_photos where id = ${id}`;
+      }
+    } catch (err) {
+      console.error(err);
+      return res.status(500).json({ ok: false, error: 'Could not delete right now. Nothing was changed, please try again.' });
+    }
+    return res.status(200).json({ ok: true });
   }
 
   return res.status(405).json({ ok: false, error: 'Method not allowed' });

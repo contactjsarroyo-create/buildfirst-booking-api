@@ -11,6 +11,8 @@ import { releaseStorage } from './limits.js';
 //                          N days after check-out (tenant_settings.image_retention_days).
 //   kind 'question_image'  reference image the owner attached to a booking-form
 //                          question. Never auto-deleted, owner deletes manually.
+//   kind 'room_photo'      photo of a room type, shown in the booking form and
+//                          widget. Never auto-deleted, owner deletes manually.
 //
 // tenants.storage_bytes stays the running total used for plan limits;
 // this file keeps it in step (releaseStorage) whenever a file is removed.
@@ -86,6 +88,8 @@ async function scrubReferences(tenantId, url) {
       and jsonb_typeof(custom_field_responses) = 'object'
       and position(${url} in custom_field_responses::text) > 0
   `;
+  // A deleted room photo also leaves the room type's photo list.
+  await sql`delete from unit_type_photos where url = ${url}`;
   await sql`
     update tenant_settings set custom_fields = (
       select coalesce(
@@ -205,6 +209,7 @@ export async function storageBreakdown(tenantId) {
   const out = {
     guest_upload: { files: 0, bytes: 0 },
     question_image: { files: 0, bytes: 0 },
+    room_photo: { files: 0, bytes: 0 },
   };
   for (const row of r.rows) {
     if (out[row.kind]) out[row.kind] = { files: row.files, bytes: Number(row.bytes) || 0 };

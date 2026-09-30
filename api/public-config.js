@@ -172,6 +172,20 @@ export default async function handler(req, res) {
       unitRows = units.rows;
       addonRows = addons.rows;
 
+      // Room photos (cover photo first) so the booking form and widget can show them.
+      const photoRes = await sql`
+        select p.unit_type_id::text as unit_type_id, p.url
+        from unit_type_photos p
+        join unit_types u on u.id = p.unit_type_id
+        where u.tenant_id = ${tenant.id} and u.is_active = true
+        order by p.display_order, p.id
+      `;
+      const photosByType = {};
+      photoRes.rows.forEach((r) => {
+        (photosByType[r.unit_type_id] = photosByType[r.unit_type_id] || []).push(r.url);
+      });
+      unitRows = unitRows.map((u) => ({ ...u, photos: photosByType[String(u.id)] || [] }));
+
       const windowDays = settings.booking_window_days ? Number(settings.booking_window_days) : 365;
       unavailable = await computeUnavailable(
         tenant.id,
