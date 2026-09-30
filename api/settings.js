@@ -28,6 +28,7 @@ import {
 } from './_lib/storage.js';
 import { sanitizeEmailConfig, EMAIL_DEFAULTS, PLACEHOLDERS } from './_lib/emailcore.js';
 import { sendTestEmail } from './_lib/bookingemails.js';
+import { getMoneySettings, saveMoneySettings } from './_lib/money.js';
 
 const HEX_RE = /^#[0-9a-fA-F]{6}$/;
 const FONT_WHITELIST = [
@@ -428,6 +429,25 @@ async function handleEmails(req, res, auth) {
 }
 
 // ------------------------------------------------------------
+// Money settings (owner only): VAT registration, service charge and deposits.
+// Reached via /api/settings?resource=money. It never touches any other setting.
+//   GET   current money settings
+//   PUT   { vat_registered, vat_percent, service_charge_enabled, service_charge_percent,
+//           deposit_enabled, deposit_kind, deposit_percent, deposit_fixed }
+// ------------------------------------------------------------
+async function handleMoney(req, res, auth) {
+  if (staffBlocked(auth, res)) return;
+  if (req.method === 'GET') {
+    return res.status(200).json({ ok: true, settings: await getMoneySettings(auth.tenant_id) });
+  }
+  if (req.method === 'PUT') {
+    const r = await saveMoneySettings(auth.tenant_id, req.body);
+    return res.status(r.status).json(r.json);
+  }
+  return res.status(405).json({ ok: false, error: 'Method not allowed' });
+}
+
+// ------------------------------------------------------------
 // Staff logins (owner only). Reached via /api/settings?resource=staff
 // (merged here to stay under Vercel's 12-function cap).
 //   GET     owner email, staff list, how many are used, the plan limit
@@ -632,6 +652,9 @@ export default async function handler(req, res) {
     }
     if (req.query && req.query.resource === 'staff') {
       return await handleStaff(req, res, auth);
+    }
+    if (req.query && req.query.resource === 'money') {
+      return await handleMoney(req, res, auth);
     }
 
     if (req.method === 'GET') {

@@ -3,6 +3,7 @@ import { computeQuote } from './pricing.js';
 import { getAccount, countBookingsThisMonth } from './limits.js';
 import { addGuestInfo, attachGuestToBooking } from './guests.js';
 import { PERSON_TYPES, roomDiscount, itemsDiscount, vatRateOf } from './discounts.js';
+import { getMoneySettings } from './money.js';
 
 // Front Desk: arrivals, in-house guests, check-in / check-out, folio (extra
 // charges and payments), room status, staff-entered walk-in bookings.
@@ -56,6 +57,22 @@ function balanceOf(row) {
   return round2(
     total + (Number(row.folio_charges) || 0) - paidOnBooking - (Number(row.folio_payments) || 0) + (Number(row.folio_refunds) || 0) - (Number(row.folio_discounts) || 0)
   );
+}
+
+const isServiceCharge = (r) => String(r.description || '').startsWith('Service charge');
+const isDeposit = (r) => String(r.description || '').startsWith('Deposit');
+
+function pctWords(p) {
+  return String(Number(p));
+}
+
+// Service charge = the resort's percent of the room price before VAT (after any
+// promo) plus the extra charges already on the bill (not counting an earlier
+// service charge). It is added on the bill only, never at online booking.
+function serviceChargeFor(b, chargeRows, percent) {
+  const room = (Number(b.base_amount) || 0) + (Number(b.addons_amount) || 0) - (Number(b.discount_amount) || 0);
+  const extras = chargeRows.filter((r) => r.kind === 'charge' && !isServiceCharge(r)).reduce((a, r) => a + (Number(r.amount) || 0), 0);
+  return round2(Math.max(0, room + extras) * (Number(percent) / 100));
 }
 
 // ------------------------------------------------------------
@@ -195,13 +212,42 @@ export async function getFolio(tenantId, bookingId) {
     where booking_id = ${bookingId} and tenant_id = ${tenantId} and voided_at is null
     order by created_at
   `;
+  // The resort's optional money settings, so the bill can offer a service
+  // charge or a deposit only when the resort turned them on.
+  let ms;
+  try {
+    ms = await getMoneySettings(tenantId);
+  } catch (err) {
+    ms = { service_charge_enabled: false, service_charge_percent: 10, deposit_enabled: false, deposit_kind: 'percent', deposit_percent: 0, deposit_fixed: 0 };
+  }
+  const balance = balanceOf(b);
+  const total = Number(b.total_amount) || 0;
+  let depositSuggested = 0;
+  if (ms.deposit_enabled) {
+    depositSuggested = ms.deposit_kind === 'fixed' ? ms.deposit_fixed : round2((total * ms.deposit_percent) / 100);
+    depositSuggested = round2(Math.min(depositSuggested, Math.max(0, balance)));
+  }
+  const scApplied = items.rows.some((r) => r.kind === 'charge' && isServiceCharge(r));
   return done({
     folio: {
       booking_id: b.id,
-      total_amount: Number(b.total_amount) || 0,
+      total_amount: total,
       paid_on_booking: b.payment_status === 'paid',
       items: items.rows,
-      balance_due: balanceOf(b),
+      balance_due: balance,
+      money: {
+        service_charge: {
+          enabled: ms.service_charge_enabled === true,
+          percent: ms.service_charge_percent,
+          applied: scApplied,
+          preview: ms.service_charge_enabled ? serviceChargeFor(b, items.rows, ms.service_charge_percent) : 0,
+        },
+        deposit: {
+          enabled: ms.deposit_enabled === true,
+          taken: items.rows.some((r) => r.kind === 'payment' && isDeposit(r)),
+          suggested: depositSuggested,
+        },
+      },
     },
   });
 }
@@ -388,6 +434,10 @@ async function run(auth, body) {
     const method = body.method ? String(body.method).trim().slice(0, 40) : null;
     const b = await loadBooking(tenantId, id);
     if (!b) return fail(404, 'Booking not found');
+    if (kind === 'payment' && description.startsWith('Deposit')) {
+      const ms = await getMoneySettings(tenantId);
+      if (!ms.deposit_enabled) return fail(409, 'Deposits are turned off. The owner can turn them on in Money, Settings.');
+    }
     if (kind === 'payment') {
       // Never take more than what is owed. This also stops the same money being
       // recorded twice (once as "Mark as paid", once on the bill).
@@ -403,6 +453,28 @@ async function run(auth, body) {
   }
 
   if (action === 'add_discount') return addDiscount(tenantId, id, body);
+
+  if (action === 'add_service_charge') {
+    const ms = await getMoneySettings(tenantId);
+    if (!ms.service_charge_enabled) return fail(409, 'The service charge is turned off. The owner can turn it on in Money, Settings.');
+    const b = await loadBooking(tenantId, id);
+    if (!b) return fail(404, 'Booking not found');
+    if (b.status === 'cancelled') return fail(400, 'This booking is cancelled.');
+    const lines = await sql`
+      select kind, description, amount from folio_items
+      where booking_id = ${id} and tenant_id = ${tenantId} and voided_at is null
+    `;
+    if (lines.rows.some((r) => r.kind === 'charge' && isServiceCharge(r))) {
+      return fail(409, 'A service charge is already on this bill. Remove it first if you want to add it again.');
+    }
+    const amount = serviceChargeFor(b, lines.rows, ms.service_charge_percent);
+    if (!(amount > 0)) return fail(400, 'There is nothing to charge a service charge on.');
+    await sql`
+      insert into folio_items (tenant_id, booking_id, kind, description, amount)
+      values (${tenantId}, ${id}, 'charge', ${'Service charge (' + pctWords(ms.service_charge_percent) + '%)'}, ${amount})
+    `;
+    return done({ amount });
+  }
 
   if (action === 'void_folio') {
     if (!UUID_RE.test(String(body.item_id || ''))) return fail(400, 'Please choose a valid line');
@@ -543,7 +615,12 @@ async function addDiscount(tenantId, id, body) {
   } else {
     const typed = round2(body.amount);
     if (!(typed > 0) || typed > MAX_AMOUNT) return fail(400, 'Please enter how much their own food and drinks came to.');
-    const charged = Number(b.folio_charges) || 0;
+    const scRows = await sql`
+      select coalesce(sum(amount), 0) as sc from folio_items
+      where booking_id = ${id} and tenant_id = ${tenantId} and kind = 'charge' and voided_at is null
+        and description like 'Service charge%'
+    `;
+    const charged = (Number(b.folio_charges) || 0) - (Number(scRows.rows[0].sc) || 0);
     const already = existing.filter((r) => r.discount_scope === 'items').reduce((a, r) => a + (Number(r.basis) || 0), 0);
     const room = round2(charged - already);
     if (typed > room + 0.005) {

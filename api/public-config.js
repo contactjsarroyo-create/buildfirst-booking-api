@@ -134,7 +134,7 @@ export default async function handler(req, res) {
     const s = await sql`
       SELECT primary_color, logo_url,
              checkin_time::text AS checkin_time, checkout_time::text AS checkout_time,
-             cancellation_policy, vat_percent, min_stay_nights, booking_window_days,
+             cancellation_policy, vat_percent, vat_registered, min_stay_nights, booking_window_days,
              theme, payment_channels, custom_fields, widget_template, details_config
       FROM tenant_settings WHERE tenant_id = ${tenant.id}
     `;
@@ -221,7 +221,13 @@ export default async function handler(req, res) {
         checkin_time: settings.checkin_time ? String(settings.checkin_time).slice(0, 5) : '14:00',
         checkout_time: settings.checkout_time ? String(settings.checkout_time).slice(0, 5) : '12:00',
         cancellation_policy: settings.cancellation_policy || null,
-        vat_percent: settings.vat_percent !== undefined && settings.vat_percent !== null ? Number(settings.vat_percent) : 12,
+        // Not VAT-registered means no VAT is added, so the widget sees 0.
+        vat_percent:
+          settings.vat_registered === false
+            ? 0
+            : settings.vat_percent !== undefined && settings.vat_percent !== null
+              ? Number(settings.vat_percent)
+              : 12,
         min_stay_nights: settings.min_stay_nights || 1,
         booking_window_days: settings.booking_window_days || 365,
         theme: settings.theme || null,

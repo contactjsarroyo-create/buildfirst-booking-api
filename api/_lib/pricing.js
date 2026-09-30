@@ -66,11 +66,14 @@ export async function computeQuote(input) {
   const today = todayIn(tenantResult.rows[0].timezone);
 
   const settingsResult = await sql`
-    SELECT vat_percent, min_stay_nights, booking_window_days
+    SELECT vat_percent, vat_registered, min_stay_nights, booking_window_days
     FROM tenant_settings WHERE tenant_id = ${tenant_id}
   `;
   const s = settingsResult.rows[0];
-  const vatPercent = s && s.vat_percent !== null ? Number(s.vat_percent) : 12;
+  // A resort that is not VAT-registered adds no VAT at all. The saved percent
+  // is kept, so switching registration back on restores it.
+  const vatRegistered = !(s && s.vat_registered === false);
+  const vatPercent = !vatRegistered ? 0 : s && s.vat_percent !== null ? Number(s.vat_percent) : 12;
   const minStay = s && s.min_stay_nights !== null ? Number(s.min_stay_nights) : 1;
   const windowDays = s && s.booking_window_days !== null ? Number(s.booking_window_days) : 365;
 

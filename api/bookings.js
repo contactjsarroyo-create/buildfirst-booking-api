@@ -7,7 +7,7 @@ import { recordFileOrRollback, linkFilesToBooking } from './_lib/storage.js';
 import { sendBookingCreatedEmails, withTimeout } from './_lib/bookingemails.js';
 import { getFrontDesk, getFolio } from './_lib/frontdesk.js';
 import { listGuests, getGuest, addGuestInfo, attachGuestToBooking } from './_lib/guests.js';
-import { getClosing, getStatement } from './_lib/money.js';
+import { getClosing, getStatement, getExpenses } from './_lib/money.js';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -208,6 +208,17 @@ export default async function handler(req, res) {
       try {
         const c = await getClosing(auth.tenant_id, req.query.from, req.query.to || req.query.from);
         return res.status(c.status).json(c.json);
+      } catch (err) {
+        console.error(err);
+        return res.status(500).json({ ok: false, error: 'Server error' });
+      }
+    }
+    // Expenses are Money too.
+    if (resource === 'expenses') {
+      if (staffCannot(auth, res, 'money', 'view')) return;
+      try {
+        const x = await getExpenses(auth.tenant_id, req.query.from, req.query.to || req.query.from);
+        return res.status(x.status).json(x.json);
       } catch (err) {
         console.error(err);
         return res.status(500).json({ ok: false, error: 'Server error' });

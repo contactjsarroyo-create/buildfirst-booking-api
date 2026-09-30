@@ -5,6 +5,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 import { sendBookingConfirmedEmail, withTimeout } from './_lib/bookingemails.js';
 import { frontDeskAction } from './_lib/frontdesk.js';
 import { guestAction, GUEST_ACTIONS } from './_lib/guests.js';
+import { moneyAction, MONEY_ACTIONS } from './_lib/money.js';
 
 export default async function handler(req, res) {
   if (setCors(req, res, 'PATCH, OPTIONS')) return;
@@ -14,6 +15,14 @@ export default async function handler(req, res) {
 
   const auth = await getAuth(req);
   if (!auth) return res.status(401).json({ ok: false, error: 'Unauthorized' });
+  // Expenses belong to the Money area, so they are checked before the
+  // Bookings "edit" rule below (a person may have Money but no Bookings).
+  if (req.body && MONEY_ACTIONS.includes(req.body.action)) {
+    if (staffCannot(auth, res, 'money', 'edit')) return;
+    const r = await moneyAction(auth, req.body);
+    return res.status(r.status).json(r.json);
+  }
+
   // Every change here (confirm, cancel, paid, archive, seen, room, note) needs
   // Bookings "edit" for staff.
   if (staffCannot(auth, res, 'bookings', 'edit')) return;
