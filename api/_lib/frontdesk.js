@@ -2,6 +2,7 @@ import { sql } from '@vercel/postgres';
 import { computeQuote } from './pricing.js';
 import { getAccount, countBookingsThisMonth } from './limits.js';
 import { addGuestInfo, attachGuestToBooking } from './guests.js';
+import { PERSON_TYPES, roomDiscount, itemsDiscount, vatRateOf } from './discounts.js';
 
 // Front Desk: arrivals, in-house guests, check-in / check-out, folio (extra
 // charges and payments), room status, staff-entered walk-in bookings.
@@ -53,7 +54,7 @@ function balanceOf(row) {
   const total = Number(row.total_amount) || 0;
   const paidOnBooking = row.payment_status === 'paid' ? total : 0;
   return round2(
-    total + (Number(row.folio_charges) || 0) - paidOnBooking - (Number(row.folio_payments) || 0) + (Number(row.folio_refunds) || 0)
+    total + (Number(row.folio_charges) || 0) - paidOnBooking - (Number(row.folio_payments) || 0) + (Number(row.folio_refunds) || 0) - (Number(row.folio_discounts) || 0)
   );
 }
 
@@ -71,12 +72,14 @@ export async function getFrontDesk(tenantId) {
            b.checked_in_at, b.checked_out_at, b.guest_id_type, b.guest_id_number,
            coalesce(f.charges, 0) as folio_charges,
            coalesce(f.payments, 0) as folio_payments,
-           coalesce(f.refunds, 0) as folio_refunds
+           coalesce(f.refunds, 0) as folio_refunds,
+           coalesce(f.discounts, 0) as folio_discounts
     from bookings b
     left join lateral (
       select sum(amount) filter (where kind = 'charge') as charges,
              sum(amount) filter (where kind = 'payment') as payments,
-             sum(amount) filter (where kind = 'refund') as refunds
+             sum(amount) filter (where kind = 'refund') as refunds,
+             sum(amount) filter (where kind = 'discount') as discounts
       from folio_items where booking_id = b.id and voided_at is null
     ) f on true
     where b.tenant_id = ${tenantId}
@@ -152,7 +155,8 @@ export async function getFolio(tenantId, bookingId) {
   const b = await loadBooking(tenantId, bookingId);
   if (!b) return fail(404, 'Booking not found');
   const items = await sql`
-    select id, kind, description, amount, method, created_at
+    select id, kind, description, amount, method, created_at,
+           person_type, person_name, person_id, discount_scope, basis, discount_part, vat_part, exempt_sale
     from folio_items
     where booking_id = ${bookingId} and tenant_id = ${tenantId} and voided_at is null
     order by created_at
@@ -173,12 +177,14 @@ async function loadBooking(tenantId, bookingId) {
     select b.*, b.check_in::text as ci, b.check_out::text as co,
            coalesce(f.charges, 0) as folio_charges,
            coalesce(f.payments, 0) as folio_payments,
-           coalesce(f.refunds, 0) as folio_refunds
+           coalesce(f.refunds, 0) as folio_refunds,
+           coalesce(f.discounts, 0) as folio_discounts
     from bookings b
     left join lateral (
       select sum(amount) filter (where kind = 'charge') as charges,
              sum(amount) filter (where kind = 'payment') as payments,
-             sum(amount) filter (where kind = 'refund') as refunds
+             sum(amount) filter (where kind = 'refund') as refunds,
+             sum(amount) filter (where kind = 'discount') as discounts
       from folio_items where booking_id = b.id and voided_at is null
     ) f on true
     where b.id = ${bookingId} and b.tenant_id = ${tenantId}
@@ -362,6 +368,8 @@ async function run(auth, body) {
     return done({});
   }
 
+  if (action === 'add_discount') return addDiscount(tenantId, id, body);
+
   if (action === 'void_folio') {
     if (!UUID_RE.test(String(body.item_id || ''))) return fail(400, 'Please choose a valid line');
     const r = await sql`
@@ -451,4 +459,75 @@ async function walkIn(auth, body) {
     if (!r.json.ok) checkInError = r.json.error;
   }
   return done({ booking_id: bookingId, check_in_error: checkInError });
+}
+
+// ------------------------------------------------------------
+// SENIOR CITIZEN / PWD DISCOUNT, given on the bill, one person at a time.
+// Saved as a bill line of kind 'discount' (the amount is how much the bill goes
+// down). Scope 'room' = the person's share of the room; scope 'items' = their
+// own food, drinks and services (amount typed by staff, must already be on the
+// bill as extra charges). The ID number is required and printed on the statement.
+// ------------------------------------------------------------
+async function addDiscount(tenantId, id, body) {
+  const personType = String(body.person_type || '');
+  if (!PERSON_TYPES[personType]) return fail(400, 'Please choose Senior citizen or PWD.');
+  const scope = String(body.scope || '');
+  if (scope !== 'room' && scope !== 'items') return fail(400, 'Please choose what the discount is for.');
+  const personName = String(body.person_name || '').trim().slice(0, 120);
+  if (!personName) return fail(400, "Please enter the person's name.");
+  const personId = String(body.id_number || '').trim().slice(0, 60);
+  if (!personId) return fail(400, 'Please enter the ID number. It is printed on the bill.');
+
+  const b = await loadBooking(tenantId, id);
+  if (!b) return fail(404, 'Booking not found');
+  if (b.status === 'cancelled') return fail(400, 'This booking is cancelled.');
+
+  const ex = await sql`
+    select discount_scope, person_name, person_id, person_type, basis
+    from folio_items
+    where booking_id = ${id} and tenant_id = ${tenantId} and kind = 'discount' and voided_at is null
+  `;
+  const existing = ex.rows;
+  const sameName = (r) => String(r.person_name || '').trim().toLowerCase() === personName.toLowerCase();
+  const sameId = (r) => String(r.person_id || '').trim().toLowerCase() === personId.toLowerCase();
+  const samePerson = existing.filter((r) => sameName(r) || sameId(r));
+  if (samePerson.some((r) => r.person_type !== personType)) {
+    return fail(409, 'This person already has a different kind of discount on this bill. Only one discount type per person.');
+  }
+
+  let calc;
+  if (scope === 'room') {
+    const roomOnes = existing.filter((r) => r.discount_scope === 'room');
+    const guests = Math.max(1, Math.floor(Number(b.guests)) || 1);
+    if (samePerson.some((r) => r.discount_scope === 'room')) {
+      return fail(409, 'This person already has the room discount on this bill.');
+    }
+    if (roomOnes.length >= guests) {
+      return fail(409, 'Only ' + guests + (guests === 1 ? ' guest is' : ' guests are') + ' staying, so no more room discounts can be given.');
+    }
+    calc = roomDiscount(b);
+  } else {
+    const typed = round2(body.amount);
+    if (!(typed > 0) || typed > MAX_AMOUNT) return fail(400, 'Please enter how much their own food and drinks came to.');
+    const charged = Number(b.folio_charges) || 0;
+    const already = existing.filter((r) => r.discount_scope === 'items').reduce((a, r) => a + (Number(r.basis) || 0), 0);
+    const room = round2(charged - already);
+    if (typed > room + 0.005) {
+      return fail(409, 'That is more than the extra charges on the bill that have no discount yet (' + Math.max(0, room).toFixed(2) + '). Add their food and drinks to the bill first.');
+    }
+    calc = itemsDiscount(typed, vatRateOf(b));
+  }
+  if (!(calc.amount > 0)) return fail(400, 'There is nothing to take off here.');
+
+  const description = PERSON_TYPES[personType] + ' discount, ' + (scope === 'room' ? 'room' : 'own food and drinks');
+  await sql`
+    insert into folio_items (
+      tenant_id, booking_id, kind, description, amount,
+      person_type, person_name, person_id, discount_scope, basis, discount_part, vat_part, exempt_sale
+    ) values (
+      ${tenantId}, ${id}, 'discount', ${description}, ${calc.amount},
+      ${personType}, ${personName}, ${personId}, ${scope}, ${calc.basis}, ${calc.discount_part}, ${calc.vat_part}, ${calc.exempt_sale}
+    )
+  `;
+  return done({ amount: calc.amount });
 }

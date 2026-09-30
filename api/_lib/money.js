@@ -115,9 +115,14 @@ export async function getClosing(tenantId, from, to) {
     });
   }
   let chargesPosted = 0;
+  let discountsGiven = 0;
   for (const f of folio.rows) {
     if (f.kind === 'charge') {
       chargesPosted += Number(f.amount) || 0;
+      continue;
+    }
+    if (f.kind === 'discount') {
+      discountsGiven += Number(f.amount) || 0;
       continue;
     }
     if (f.kind !== 'payment' && f.kind !== 'refund') continue;
@@ -164,13 +169,15 @@ export async function getClosing(tenantId, from, to) {
   const owing = await sql`
     select b.id as booking_id, b.guest_name, b.check_in::text as check_in, b.check_out::text as check_out,
            b.total_amount, b.payment_status, b.checked_in_at, b.checked_out_at, r.label as room,
-           coalesce(f.charges, 0) as charges, coalesce(f.payments, 0) as payments, coalesce(f.refunds, 0) as refunds
+           coalesce(f.charges, 0) as charges, coalesce(f.payments, 0) as payments, coalesce(f.refunds, 0) as refunds,
+           coalesce(f.discounts, 0) as discounts
     from bookings b
     left join rooms r on r.id = b.room_id
     left join lateral (
       select sum(amount) filter (where kind = 'charge') as charges,
              sum(amount) filter (where kind = 'payment') as payments,
-             sum(amount) filter (where kind = 'refund') as refunds
+             sum(amount) filter (where kind = 'refund') as refunds,
+             sum(amount) filter (where kind = 'discount') as discounts
       from folio_items where booking_id = b.id and voided_at is null
     ) f on true
     where b.tenant_id = ${tenantId}
@@ -183,7 +190,7 @@ export async function getClosing(tenantId, from, to) {
   let unpaidTotal = 0;
   for (const o of owing.rows) {
     const total = Number(o.total_amount) || 0;
-    const balance = round2(total + Number(o.charges) - (o.payment_status === 'paid' ? total : 0) - Number(o.payments) + Number(o.refunds));
+    const balance = round2(total + Number(o.charges) - (o.payment_status === 'paid' ? total : 0) - Number(o.payments) + Number(o.refunds) - Number(o.discounts));
     if (balance > 0.005) {
       unpaidTotal += balance;
       unpaidRows.push({
@@ -204,6 +211,7 @@ export async function getClosing(tenantId, from, to) {
       refunded: round2(refunded),
       net: round2(received - refunded),
       charges_posted: round2(chargesPosted),
+      discounts_given: round2(discountsGiven),
       methods,
       days: span > 1 ? days : [],
       lines: lines.slice(0, MAX_LINES),
@@ -255,6 +263,7 @@ export async function getStatement(tenantId, bookingId) {
 
   const fr = await sql`
     select id, kind, description, amount, method, created_at,
+           person_type, person_name, person_id, discount_scope, basis, discount_part, vat_part, exempt_sale,
            (created_at at time zone ${t.timezone})::date::text as day
     from folio_items
     where booking_id = ${bookingId} and tenant_id = ${tenantId} and voided_at is null
@@ -268,13 +277,28 @@ export async function getStatement(tenantId, bookingId) {
   const charges = sum('charge');
   const payments = sum('payment');
   const refunds = sum('refund');
+  const discountRows = fr.rows.filter((x) => x.kind === 'discount').map((x) => ({
+    day: x.day,
+    description: x.description,
+    person_type: x.person_type || null,
+    person_name: x.person_name || '',
+    person_id: x.person_id || '',
+    scope: x.discount_scope || null,
+    basis: round2(x.basis),
+    discount_part: round2(x.discount_part),
+    vat_part: round2(x.vat_part),
+    exempt_sale: round2(x.exempt_sale),
+    amount: round2(x.amount),
+  }));
+  const discountsTotal = sum('discount');
+  const vatExempt = round2(discountRows.reduce((a, d) => a + d.exempt_sale, 0));
 
   const total = Number(b.total_amount) || 0;
   const paidOnBooking = b.payment_status === 'paid' ? total : 0;
   const paidDay = b.payment_confirmed_at
     ? new Date(b.payment_confirmed_at).toLocaleDateString('en-CA', { timeZone: t.timezone })
     : null;
-  const balance = round2(total + charges - paidOnBooking - payments + refunds);
+  const balance = round2(total + charges - paidOnBooking - payments + refunds - discountsTotal);
   const base = Number(b.base_amount) || 0;
   const nights = Number(b.nights) || 1;
 
@@ -313,6 +337,9 @@ export async function getStatement(tenantId, bookingId) {
         payments_total: payments,
         refunds: items.filter((i) => i.kind === 'refund'),
         refunds_total: refunds,
+        discounts: discountRows,
+        discounts_total: discountsTotal,
+        vat_exempt_sales: vatExempt,
         balance,
       },
     },

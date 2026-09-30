@@ -250,15 +250,17 @@ export default async function handler(req, res) {
                      AND x.check_in < b.check_in
                      AND x.status = 'confirmed' AND x.no_show_at IS NULL)::int AS guest_earlier_stays,
                  COALESCE(fp.payments, 0)::float AS bill_payments,
+                 COALESCE(fp.discounts, 0)::float AS bill_discounts,
                  (COALESCE(b.total_amount, 0) + COALESCE(fp.charges, 0)
                    - CASE WHEN b.payment_status = 'paid' THEN COALESCE(b.total_amount, 0) ELSE 0 END
-                   - COALESCE(fp.payments, 0) + COALESCE(fp.refunds, 0))::float AS balance_due
+                   - COALESCE(fp.payments, 0) + COALESCE(fp.refunds, 0) - COALESCE(fp.discounts, 0))::float AS balance_due
           FROM bookings b
           LEFT JOIN guests g ON g.id = b.guest_id AND g.tenant_id = b.tenant_id
           LEFT JOIN LATERAL (
             SELECT sum(amount) FILTER (WHERE kind = 'charge') AS charges,
                    sum(amount) FILTER (WHERE kind = 'payment') AS payments,
-                   sum(amount) FILTER (WHERE kind = 'refund') AS refunds
+                   sum(amount) FILTER (WHERE kind = 'refund') AS refunds,
+                   sum(amount) FILTER (WHERE kind = 'discount') AS discounts
             FROM folio_items WHERE booking_id = b.id AND voided_at IS NULL
           ) fp ON true
           WHERE b.tenant_id = ${auth.tenant_id}

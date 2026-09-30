@@ -70,13 +70,22 @@ export default async function handler(req, res) {
         select b.payment_status,
                (select coalesce(sum(f.amount), 0) from folio_items f
                  where f.booking_id = b.id and f.tenant_id = b.tenant_id
-                   and f.kind = 'payment' and f.voided_at is null) as bill_payments
+                   and f.kind = 'payment' and f.voided_at is null) as bill_payments,
+               (select coalesce(sum(f.amount), 0) from folio_items f
+                 where f.booking_id = b.id and f.tenant_id = b.tenant_id
+                   and f.kind = 'discount' and f.voided_at is null) as bill_discounts
         from bookings b where b.id = ${id} and b.tenant_id = ${auth.tenant_id}
       `;
       if (paidCheck.rows.length === 0) {
         return res.status(404).json({ ok: false, error: 'Booking not found' });
       }
       const pc = paidCheck.rows[0];
+      if (pc.payment_status !== 'paid' && Number(pc.bill_discounts) > 0) {
+        return res.status(409).json({
+          ok: false,
+          error: 'A senior citizen or PWD discount is on this booking\'s bill, so it can\'t be marked as paid. Open the bill at the Front Desk and record the payment there.',
+        });
+      }
       if (pc.payment_status !== 'paid' && Number(pc.bill_payments) > 0) {
         return res.status(409).json({
           ok: false,
