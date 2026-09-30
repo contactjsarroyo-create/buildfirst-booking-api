@@ -457,7 +457,7 @@ export default async function handler(req, res) {
         limitsJson = account.limits;
         usageJson = {
           unit_types: usage.unit_types,
-          rooms: Math.max(usage.rooms, usage.unit_count_total),
+          rooms: usage.rooms,
           custom_fields: usage.custom_fields,
           bookings_this_month: usage.bookings_this_month,
           storage_bytes: usage.storage_bytes,

@@ -2,8 +2,10 @@ import { sql } from '@vercel/postgres';
 
 // ------------------------------------------------------------
 // Plan limits. Keep in sync with PLANS in DashboardSignup.tsx.
-//   unit_types          room types a tenant can create
-//   rooms               individual rooms (and total unit_count) across all types
+//   unit_types          ACTIVE room types a tenant can have (inactive ones do not count)
+//   rooms               ACTIVE individual rooms inside ACTIVE room types. A
+//                       deactivated room, or every room of a deactivated room
+//                       type, does not count toward the limit.
 //   bookings_per_month  bookings created per calendar month (Asia/Manila)
 //   storage_bytes       total uploaded image storage (never resets)
 //   custom_fields       custom guest questions
@@ -97,9 +99,13 @@ export async function getAccount(tenantId) {
 export async function getUsage(tenantId) {
   const r = await sql`
     select
-      (select count(*)::int from unit_types where tenant_id = ${tenantId}) as unit_types,
-      (select count(*)::int from rooms where tenant_id = ${tenantId}) as rooms,
-      (select coalesce(sum(unit_count), 0)::int from unit_types where tenant_id = ${tenantId}) as unit_count_total,
+      (select count(*)::int from unit_types
+         where tenant_id = ${tenantId} and is_active is not false) as unit_types,
+      (select count(*)::int from rooms r
+         join unit_types u on u.id = r.unit_type_id
+         where r.tenant_id = ${tenantId} and r.is_active is not false and u.is_active is not false) as rooms,
+      (select coalesce(sum(unit_count), 0)::int from unit_types
+         where tenant_id = ${tenantId} and is_active is not false) as unit_count_total,
       (select count(*)::int from bookings
          where tenant_id = ${tenantId}
            and created_at >= (date_trunc('month', now() at time zone 'Asia/Manila') at time zone 'Asia/Manila')

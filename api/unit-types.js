@@ -119,21 +119,25 @@ export default async function handler(req, res) {
       const limits = account.limits;
 
       if (req.method === 'POST') {
-        if (usage.unit_types >= limits.unit_types) {
-          return planLimit(
-            res,
-            account,
-            `Your ${account.label} allows up to ${limits.unit_types} room types.`,
-            'unit_types'
-          );
-        }
-        if (usage.unit_count_total + newCount > limits.rooms) {
-          return planLimit(
-            res,
-            account,
-            `Your ${account.label} allows up to ${limits.rooms} rooms in total.`,
-            'rooms'
-          );
+        // Only active room types and rooms count toward the plan limits, so a
+        // room type created as inactive is never checked.
+        if (active) {
+          if (usage.unit_types >= limits.unit_types) {
+            return planLimit(
+              res,
+              account,
+              `Your ${account.label} allows up to ${limits.unit_types} active room types. Deactivate one to add another.`,
+              'unit_types'
+            );
+          }
+          if (usage.rooms + newCount > limits.rooms) {
+            return planLimit(
+              res,
+              account,
+              `Your ${account.label} allows up to ${limits.rooms} active rooms in total. Deactivate a room to add another.`,
+              'rooms'
+            );
+          }
         }
         const result = await sql`
           insert into unit_types (tenant_id, name, description, capacity_guests, base_rate, unit_count, is_active)
@@ -156,21 +160,37 @@ export default async function handler(req, res) {
 
       if (!b.id) return res.status(400).json({ ok: false, error: 'id is required' });
 
-      // Only block when the unit count is going UP past the limit, so a tenant
-      // who is over their limit (e.g. after a downgrade) can still edit rates.
+      // Limits are only checked when an inactive room type is switched back
+      // on (its active rooms start counting again). Editing anything else
+      // never blocks, so a tenant who is over their limit after a downgrade
+      // can still edit rates. "Number of rooms available" (unit_count) no
+      // longer counts: the rooms list is what counts.
       const old = await sql`
-        select unit_count from unit_types where id = ${b.id} and tenant_id = ${auth.tenant_id}
+        select is_active from unit_types where id = ${b.id} and tenant_id = ${auth.tenant_id}
       `;
       if (old.rows.length === 0) return res.status(404).json({ ok: false, error: 'Not found' });
-      const oldCount = old.rows[0].unit_count || 0;
-      const newTotal = usage.unit_count_total - oldCount + newCount;
-      if (newCount > oldCount && newTotal > limits.rooms) {
-        return planLimit(
-          res,
-          account,
-          `Your ${account.label} allows up to ${limits.rooms} rooms in total.`,
-          'rooms'
-        );
+      const wasActive = old.rows[0].is_active !== false;
+      if (active && !wasActive) {
+        if (usage.unit_types >= limits.unit_types) {
+          return planLimit(
+            res,
+            account,
+            `Your ${account.label} allows up to ${limits.unit_types} active room types. Deactivate one to turn this one back on.`,
+            'unit_types'
+          );
+        }
+        const back = await sql`
+          select count(*)::int as n from rooms
+          where unit_type_id = ${b.id} and tenant_id = ${auth.tenant_id} and is_active is not false
+        `;
+        if (usage.rooms + back.rows[0].n > limits.rooms) {
+          return planLimit(
+            res,
+            account,
+            `Your ${account.label} allows up to ${limits.rooms} active rooms in total. Deactivate some rooms to turn this room type back on.`,
+            'rooms'
+          );
+        }
       }
 
       const result = await sql`
@@ -188,11 +208,61 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, id: result.rows[0].id });
     }
 
+    if (req.method === 'DELETE') {
+      return await deleteUnitType(req, res, auth);
+    }
+
     return res.status(405).json({ ok: false, error: 'Method not allowed' });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ ok: false, error: 'Server error' });
   }
+}
+
+const TYPE_HAS_BOOKINGS = "This room type has past bookings, so it can't be deleted. Deactivate it instead.";
+const ROOM_HAS_BOOKINGS = "This room has past bookings, so it can't be deleted. Deactivate it instead.";
+
+// DELETE /api/unit-types?id=<roomTypeId>
+// Only allowed when the room type has never had a booking (any status,
+// archived or not). Deleting one with bookings would leave those bookings
+// pointing at nothing. Removes its rooms, photos (files included, storage
+// bytes released), blocked dates and date rates.
+async function deleteUnitType(req, res, auth) {
+  const id = text(req.query && req.query.id);
+  if (!id || !isUuid(id)) return res.status(400).json({ ok: false, error: 'id is required' });
+
+  const found = await sql`select id from unit_types where id = ${id} and tenant_id = ${auth.tenant_id}`;
+  if (found.rows.length === 0) return res.status(404).json({ ok: false, error: 'Room type not found' });
+
+  const used = await sql`
+    select 1 from bookings where unit_type_id = ${id} and tenant_id = ${auth.tenant_id} limit 1
+  `;
+  if (used.rows.length > 0) {
+    return res.status(409).json({ ok: false, error: TYPE_HAS_BOOKINGS, code: 'has_bookings' });
+  }
+
+  try {
+    // Photo files first (blob, tracking row, bytes). If this fails nothing
+    // else has been touched.
+    const files = await sql`
+      select f.id, f.tenant_id, f.url, f.bytes::float8 as bytes
+      from uploaded_files f
+      join unit_type_photos p on p.url = f.url
+      where p.unit_type_id = ${id} and f.tenant_id = ${auth.tenant_id} and f.kind = 'room_photo'
+    `;
+    if (files.rows.length > 0) await removeFiles(files.rows);
+
+    // Rooms, remaining photo rows, blocks and date rates go with it
+    // (ON DELETE CASCADE).
+    await sql`delete from unit_types where id = ${id} and tenant_id = ${auth.tenant_id}`;
+  } catch (err) {
+    // A booking slipped in at the same moment: the database refuses.
+    if (err && err.code === '23503') {
+      return res.status(409).json({ ok: false, error: TYPE_HAS_BOOKINGS, code: 'has_bookings' });
+    }
+    throw err;
+  }
+  return res.status(200).json({ ok: true });
 }
 
 // Individual room CRUD, reached via /api/unit-types?resource=rooms
@@ -219,16 +289,21 @@ async function handleRooms(req, res, auth) {
     // Plan limit on the total number of individual rooms.
     const account = await getAccount(auth.tenant_id);
     if (!account) return res.status(404).json({ ok: false, error: 'Account not found' });
-    const countResult = await sql`
-      select count(*)::int as n from rooms where tenant_id = ${auth.tenant_id}
+    // Only active rooms inside active room types count. A new room in an
+    // inactive room type is not checked until that room type is turned on.
+    const typeActive = await sql`
+      select is_active from unit_types where id = ${unit_type_id} and tenant_id = ${auth.tenant_id}
     `;
-    if (countResult.rows[0].n >= account.limits.rooms) {
-      return planLimit(
-        res,
-        account,
-        `Your ${account.label} allows up to ${account.limits.rooms} rooms in total.`,
-        'rooms'
-      );
+    if (typeActive.rows[0].is_active !== false) {
+      const usage = await getUsage(auth.tenant_id);
+      if (usage.rooms >= account.limits.rooms) {
+        return planLimit(
+          res,
+          account,
+          `Your ${account.label} allows up to ${account.limits.rooms} active rooms in total. Deactivate a room to add another.`,
+          'rooms'
+        );
+      }
     }
 
     const result = await sql`
@@ -247,6 +322,30 @@ async function handleRooms(req, res, auth) {
     const active = b.is_active === false ? false : true;
     if (!label) return res.status(400).json({ ok: false, error: 'label is required' });
 
+    // Turning a room back on makes it count toward the limit again, so check
+    // that first. Renaming or deactivating never blocks.
+    const current = await sql`
+      select r.is_active as room_active, u.is_active as type_active
+      from rooms r join unit_types u on u.id = r.unit_type_id
+      where r.id = ${b.id} and r.tenant_id = ${auth.tenant_id}
+    `;
+    if (current.rows.length === 0) return res.status(404).json({ ok: false, error: 'Not found' });
+    const wasActive = current.rows[0].room_active !== false;
+    const typeIsActive = current.rows[0].type_active !== false;
+    if (active && !wasActive && typeIsActive) {
+      const account = await getAccount(auth.tenant_id);
+      if (!account) return res.status(404).json({ ok: false, error: 'Account not found' });
+      const usage = await getUsage(auth.tenant_id);
+      if (usage.rooms >= account.limits.rooms) {
+        return planLimit(
+          res,
+          account,
+          `Your ${account.label} allows up to ${account.limits.rooms} active rooms in total. Deactivate another room to turn this one back on.`,
+          'rooms'
+        );
+      }
+    }
+
     const result = await sql`
       update rooms set label = ${label}, is_active = ${active}::boolean
       where id = ${b.id} and tenant_id = ${auth.tenant_id}
@@ -254,6 +353,49 @@ async function handleRooms(req, res, auth) {
     `;
     if (result.rows.length === 0) return res.status(404).json({ ok: false, error: 'Not found' });
     return res.status(200).json({ ok: true, id: result.rows[0].id });
+  }
+
+  // DELETE /api/unit-types?resource=rooms&id=<roomId>
+  // Only allowed when the room has never had a booking. Any blocked dates
+  // that named this room are cleaned up first.
+  if (req.method === 'DELETE') {
+    const id = text(req.query && req.query.id);
+    if (!id || !isUuid(id)) return res.status(400).json({ ok: false, error: 'id is required' });
+
+    const found = await sql`select id from rooms where id = ${id} and tenant_id = ${auth.tenant_id}`;
+    if (found.rows.length === 0) return res.status(404).json({ ok: false, error: 'Room not found' });
+
+    const used = await sql`
+      select 1 from bookings where room_id = ${id} and tenant_id = ${auth.tenant_id} limit 1
+    `;
+    if (used.rows.length > 0) {
+      return res.status(409).json({ ok: false, error: ROOM_HAS_BOOKINGS, code: 'has_bookings' });
+    }
+
+    // Blocks that list this room: take it out of the list, and drop the
+    // block if it was the only room left in it.
+    const blocks = await sql`
+      select id, room_ids from availability_blocks
+      where tenant_id = ${auth.tenant_id} and ${id}::text = any(room_ids::text[])
+    `;
+    for (const blk of blocks.rows) {
+      const remaining = (blk.room_ids || []).map((x) => String(x)).filter((x) => x !== id);
+      if (remaining.length === 0) {
+        await sql`delete from availability_blocks where id = ${blk.id} and tenant_id = ${auth.tenant_id}`;
+      } else {
+        await sql`update availability_blocks set room_ids = ${remaining} where id = ${blk.id} and tenant_id = ${auth.tenant_id}`;
+      }
+    }
+
+    try {
+      await sql`delete from rooms where id = ${id} and tenant_id = ${auth.tenant_id}`;
+    } catch (err) {
+      if (err && err.code === '23503') {
+        return res.status(409).json({ ok: false, error: ROOM_HAS_BOOKINGS, code: 'has_bookings' });
+      }
+      throw err;
+    }
+    return res.status(200).json({ ok: true });
   }
 
   return res.status(405).json({ ok: false, error: 'Method not allowed' });
