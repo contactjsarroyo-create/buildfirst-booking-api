@@ -12,6 +12,50 @@ export function setCors(req, res, methods) {
   return false;
 }
 
+// ------------------------------------------------------------
+// Staff permissions. The owner sets, per staff member, one level for each
+// area: 'none' (hidden and refused), 'view' (can look, cannot change) or
+// 'edit' (full access to that area). Stored as jsonb in
+// tenant_users.permissions. A staff row with nothing stored (older invites)
+// gets 'edit' everywhere, which is what staff could already do.
+//   bookings  Bookings, Calendar (blocking dates), Archive, guest details
+//   rooms     Rooms & Rates
+//   extras    Add-ons & Promos
+//   storage   Storage (view files, delete files)
+// Payments, Booking Form, Automated Emails, Share & Embed, Account Settings,
+// the Staff tab and plans are ALWAYS owner only, whatever these say.
+// ------------------------------------------------------------
+export const PERMISSION_AREAS = ['bookings', 'rooms', 'extras', 'storage'];
+const LEVEL_RANK = { none: 0, view: 1, edit: 2 };
+
+export function normalizePermissions(input) {
+  const out = {};
+  const src = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  for (const area of PERMISSION_AREAS) {
+    out[area] = LEVEL_RANK[src[area]] !== undefined ? src[area] : 'edit';
+  }
+  return out;
+}
+
+// True if this login may do `need` ('view' or 'edit') in `area`.
+// Owners and any non-staff role always may.
+export function can(auth, area, need) {
+  if (!auth || auth.role !== 'staff') return true;
+  const level = (auth.permissions && auth.permissions[area]) || 'none';
+  return LEVEL_RANK[level] >= LEVEL_RANK[need];
+}
+
+// Usage:  if (staffCannot(auth, res, 'rooms', 'edit')) return;
+export function staffCannot(auth, res, area, need) {
+  if (can(auth, area, need)) return false;
+  res.status(403).json({
+    ok: false,
+    error: 'Your login does not have permission to do this. Please ask the account owner.',
+    code: 'no_permission',
+  });
+  return true;
+}
+
 // Checks the login token AND that the person still exists. A removed staff
 // member stops working right away instead of when their 7-day token runs out,
 // and the role always comes from the database, not from the token.
@@ -28,13 +72,28 @@ export async function getAuth(req) {
   }
   if (!payload || !payload.user_id || !payload.tenant_id) return null;
   try {
-    const r = await sql`
-      select role from tenant_users
-      where id::text = ${String(payload.user_id)} and tenant_id::text = ${String(payload.tenant_id)}
-      limit 1
-    `;
+    let r;
+    try {
+      r = await sql`
+        select role, permissions from tenant_users
+        where id::text = ${String(payload.user_id)} and tenant_id::text = ${String(payload.tenant_id)}
+        limit 1
+      `;
+    } catch (colErr) {
+      // The permissions column has not been added yet: keep everyone working.
+      r = await sql`
+        select role from tenant_users
+        where id::text = ${String(payload.user_id)} and tenant_id::text = ${String(payload.tenant_id)}
+        limit 1
+      `;
+    }
     if (r.rows.length === 0) return null;
-    return { ...payload, role: r.rows[0].role };
+    const role = r.rows[0].role;
+    return {
+      ...payload,
+      role,
+      permissions: role === 'staff' ? normalizePermissions(r.rows[0].permissions) : null,
+    };
   } catch (err) {
     console.error('getAuth lookup failed', err && err.message);
     return null;

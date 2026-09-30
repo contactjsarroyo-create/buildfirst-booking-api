@@ -1,5 +1,5 @@
 import { sql } from '@vercel/postgres';
-import { setCors, getAuth, text } from './_lib/helpers.js';
+import { setCors, getAuth, staffCannot, text } from './_lib/helpers.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -9,6 +9,8 @@ export default async function handler(req, res) {
 
   const auth = await getAuth(req);
   if (!auth) return res.status(401).json({ ok: false, error: 'Unauthorized' });
+  // Blocked dates live on the calendar, so they follow the Bookings setting.
+  if (staffCannot(auth, res, 'bookings', req.method === 'GET' ? 'view' : 'edit')) return;
 
   try {
     if (req.method === 'GET') {

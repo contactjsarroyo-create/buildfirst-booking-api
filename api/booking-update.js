@@ -1,5 +1,7 @@
 import { sql } from '@vercel/postgres';
-import { setCors, getAuth } from './_lib/helpers.js';
+import { setCors, getAuth, staffCannot } from './_lib/helpers.js';
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 import { sendBookingConfirmedEmail, withTimeout } from './_lib/bookingemails.js';
 
 export default async function handler(req, res) {
@@ -10,9 +12,12 @@ export default async function handler(req, res) {
 
   const auth = await getAuth(req);
   if (!auth) return res.status(401).json({ ok: false, error: 'Unauthorized' });
+  // Every change here (confirm, cancel, paid, archive, seen, room, note) needs
+  // Bookings "edit" for staff.
+  if (staffCannot(auth, res, 'bookings', 'edit')) return;
 
   try {
-    const { id, status, mark_paid, archived, seen } = req.body || {};
+    const { id, status, mark_paid, archived, seen, room_id, note } = req.body || {};
     const allowedStatus = ['pending', 'confirmed', 'cancelled'];
 
     if (!id) {
@@ -27,8 +32,83 @@ export default async function handler(req, res) {
     if (seen !== undefined && typeof seen !== 'boolean') {
       return res.status(400).json({ ok: false, error: 'seen must be true or false' });
     }
-    if (status === undefined && !mark_paid && archived === undefined && seen === undefined) {
-      return res.status(400).json({ ok: false, error: 'Provide a status, mark_paid, archived, and/or seen' });
+    if (room_id !== undefined && !UUID_RE.test(String(room_id))) {
+      return res.status(400).json({ ok: false, error: 'Please choose a valid room' });
+    }
+    if (note !== undefined && note !== null && typeof note !== 'string') {
+      return res.status(400).json({ ok: false, error: 'note must be text' });
+    }
+    if (
+      status === undefined &&
+      !mark_paid &&
+      archived === undefined &&
+      seen === undefined &&
+      room_id === undefined &&
+      note === undefined
+    ) {
+      return res.status(400).json({ ok: false, error: 'Provide a status, mark_paid, archived, seen, room_id and/or note' });
+    }
+
+    // Move the booking to another room. Nothing is changed unless the room
+    // is free for every night of the stay. The price is not recalculated.
+    if (room_id !== undefined) {
+      const cur = await sql`
+        select status, check_in::text as check_in, check_out::text as check_out
+        from bookings where id = ${id} and tenant_id = ${auth.tenant_id}
+      `;
+      if (cur.rows.length === 0) {
+        return res.status(404).json({ ok: false, error: 'Booking not found' });
+      }
+      if (cur.rows[0].status === 'cancelled') {
+        return res.status(400).json({ ok: false, error: "A cancelled booking can't be moved to a room." });
+      }
+      const room = await sql`
+        select id, unit_type_id, is_active from rooms
+        where id = ${room_id} and tenant_id = ${auth.tenant_id}
+      `;
+      if (room.rows.length === 0) {
+        return res.status(404).json({ ok: false, error: 'That room was not found.' });
+      }
+      if (room.rows[0].is_active === false) {
+        return res.status(400).json({ ok: false, error: 'That room is turned off. Turn it on first or pick another room.' });
+      }
+      const clash = await sql`
+        select 1 from bookings
+        where tenant_id = ${auth.tenant_id} and room_id = ${room_id} and id <> ${id}
+          and status <> 'cancelled'
+          and check_in < ${cur.rows[0].check_out}::date and check_out > ${cur.rows[0].check_in}::date
+        limit 1
+      `;
+      if (clash.rows.length > 0) {
+        return res.status(409).json({ ok: false, error: 'That room already has a booking on some of these dates.' });
+      }
+      const blockClash = await sql`
+        select 1 from availability_blocks
+        where tenant_id = ${auth.tenant_id} and unit_type_id = ${room.rows[0].unit_type_id}
+          and start_date <= (${cur.rows[0].check_out}::date - 1) and end_date >= ${cur.rows[0].check_in}::date
+          and (room_ids is null or ${room_id}::text = any(room_ids::text[]))
+        limit 1
+      `;
+      if (blockClash.rows.length > 0) {
+        return res.status(409).json({ ok: false, error: 'That room is blocked on some of these dates.' });
+      }
+      await sql`
+        update bookings set room_id = ${room_id}, unit_type_id = ${room.rows[0].unit_type_id}
+        where id = ${id} and tenant_id = ${auth.tenant_id}
+      `;
+    }
+
+    // Private note for the resort team. Guests never see it.
+    if (note !== undefined) {
+      const cleanNote = note === null ? null : String(note).trim().slice(0, 2000) || null;
+      const noteResult = await sql`
+        update bookings set owner_note = ${cleanNote}
+        where id = ${id} and tenant_id = ${auth.tenant_id}
+        returning id
+      `;
+      if (noteResult.rows.length === 0) {
+        return res.status(404).json({ ok: false, error: 'Booking not found' });
+      }
     }
 
     // Status/payment updates first (unchanged logic), archiving is a separate
@@ -94,8 +174,7 @@ export default async function handler(req, res) {
     }
 
     const final = await sql`
-      select id, status, payment_status, payment_confirmed_at, is_archived, seen_at
-      from bookings
+      select * from bookings
       where id = ${id} and tenant_id = ${auth.tenant_id}
     `;
     if (final.rows.length === 0) {

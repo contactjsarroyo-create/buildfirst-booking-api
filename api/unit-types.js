@@ -1,6 +1,6 @@
 import { sql } from '@vercel/postgres';
 import { put } from '@vercel/blob';
-import { setCors, getAuth, num, text } from './_lib/helpers.js';
+import { setCors, getAuth, can, staffCannot, num, text } from './_lib/helpers.js';
 import { getAccount, getUsage, planLimit, blocked, reserveStorage, releaseStorage } from './_lib/limits.js';
 import { recordFileOrRollback, removeFiles, isUuid } from './_lib/storage.js';
 
@@ -46,6 +46,18 @@ export default async function handler(req, res) {
 
   const auth = await getAuth(req);
   if (!auth) return res.status(401).json({ ok: false, error: 'Unauthorized' });
+
+  // Reading the room list is also needed by the calendar and booking list
+  // (room names), so it is open to anyone who can see Rooms & Rates OR
+  // Bookings. Every change (room types, rooms, photos) needs Rooms & Rates
+  // "edit".
+  if (req.method === 'GET') {
+    if (!can(auth, 'rooms', 'view') && !can(auth, 'bookings', 'view')) {
+      if (staffCannot(auth, res, 'rooms', 'view')) return;
+    }
+  } else if (staffCannot(auth, res, 'rooms', 'edit')) {
+    return;
+  }
 
   const rq = req.query && req.query.resource;
   const resource = rq === 'rooms' ? 'rooms' : rq === 'photos' ? 'photos' : 'unit_types';

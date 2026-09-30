@@ -1,6 +1,6 @@
 import { sql } from '@vercel/postgres';
 import { put } from '@vercel/blob';
-import { setCors, getAuth, staffBlocked, num, text } from './_lib/helpers.js';
+import { setCors, getAuth, staffBlocked, staffCannot, normalizePermissions, PERMISSION_AREAS, num, text } from './_lib/helpers.js';
 import crypto from 'crypto';
 import { issueToken } from './_lib/authtokens.js';
 import { sendEmail, appLink, staffInviteEmail } from './_lib/email.js';
@@ -300,6 +300,10 @@ function parseImageDataUrl(input) {
 // always free up space.
 // ------------------------------------------------------------
 async function handleStorage(req, res, auth) {
+  // Staff need the Storage setting: "view" to look, "edit" to delete files.
+  // Changing the auto-delete setting (PUT) is owner only, checked below.
+  if (req.method === 'GET' && staffCannot(auth, res, 'storage', 'view')) return;
+  if (req.method === 'DELETE' && staffCannot(auth, res, 'storage', 'edit')) return;
   const account = await getAccount(auth.tenant_id);
   if (!account) return res.status(404).json({ ok: false, error: 'Account not found' });
 
@@ -457,6 +461,20 @@ async function sendInvite(userId, email, tenantId) {
   return sent.ok ? { ok: true } : { ok: false, error: sent.error };
 }
 
+// Reads a permissions object from a request. Returns null unless EVERY area
+// is present and is exactly 'none', 'view' or 'edit', so a typo can never
+// quietly grant access.
+function readPermissionsInput(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
+  const out = {};
+  for (const area of PERMISSION_AREAS) {
+    const v = input[area];
+    if (v !== 'none' && v !== 'view' && v !== 'edit') return null;
+    out[area] = v;
+  }
+  return out;
+}
+
 async function handleStaff(req, res, auth) {
   if (staffBlocked(auth, res)) return;
 
@@ -469,7 +487,7 @@ async function handleStaff(req, res, auth) {
       where tenant_id = ${auth.tenant_id} and role is distinct from 'staff' limit 1
     `;
     const staff = await sql`
-      select u.id, u.email,
+      select u.id, u.email, u.permissions,
         (u.email_verified_at is not null) as accepted
       from tenant_users u
       where u.tenant_id = ${auth.tenant_id} and u.role = 'staff'
@@ -478,7 +496,13 @@ async function handleStaff(req, res, auth) {
     return res.status(200).json({
       ok: true,
       owner_email: (owner.rows[0] && owner.rows[0].email) || '',
-      staff: staff.rows.map((r) => ({ id: String(r.id), email: r.email, accepted: !!r.accepted })),
+      staff: staff.rows.map((r) => ({
+        id: String(r.id),
+        email: r.email,
+        accepted: !!r.accepted,
+        permissions: normalizePermissions(r.permissions),
+      })),
+      areas: PERMISSION_AREAS,
       used: staff.rows.length,
       limit: account.limits.staff_logins,
     });
@@ -500,6 +524,22 @@ async function handleStaff(req, res, auth) {
       if (r.throttled) return res.status(429).json({ ok: false, error: 'An invite was just sent. Please wait a minute before sending another.' });
       if (!r.ok) return res.status(502).json({ ok: false, error: 'The invite email could not be sent. Please try again in a moment.' });
       return res.status(200).json({ ok: true });
+    }
+
+    // Change what one staff member is allowed to do. Every area must be
+    // 'none', 'view' or 'edit'; anything else is refused (never guessed).
+    if (b.action === 'permissions') {
+      const p = readPermissionsInput(b.permissions);
+      if (!p) {
+        return res.status(400).json({ ok: false, error: 'Please choose No access, View only or Can edit for each area.' });
+      }
+      const upd = await sql`
+        update tenant_users set permissions = ${JSON.stringify(p)}::jsonb
+        where id::text = ${String(b.id || '')} and tenant_id = ${auth.tenant_id} and role = 'staff'
+        returning id
+      `;
+      if (upd.rows.length === 0) return res.status(404).json({ ok: false, error: 'That person was not found.' });
+      return res.status(200).json({ ok: true, permissions: p });
     }
 
     if (!account.can_book) return blocked(res, account);
@@ -524,20 +564,31 @@ async function handleStaff(req, res, auth) {
       return res.status(409).json({ ok: false, error: 'That email already has a login. Please use a different email address.' });
     }
 
+    // Permissions chosen when inviting. Left out = the default set below.
+    let invitePerms = normalizePermissions(null);
+    if (b.permissions !== undefined) {
+      const p = readPermissionsInput(b.permissions);
+      if (!p) {
+        return res.status(400).json({ ok: false, error: 'Please choose No access, View only or Can edit for each area.' });
+      }
+      invitePerms = p;
+    }
+    const permsJson = JSON.stringify(invitePerms);
+
     const col = await passwordColumn();
     if (!col) return res.status(500).json({ ok: false, error: 'Server error' });
     const unusable = '!invite!' + crypto.randomBytes(24).toString('hex');
     let created;
     if (col === 'password_hash') {
       created = await sql`
-        insert into tenant_users (tenant_id, email, password_hash, role)
-        values (${auth.tenant_id}, ${email}, ${unusable}, 'staff')
+        insert into tenant_users (tenant_id, email, password_hash, role, permissions)
+        values (${auth.tenant_id}, ${email}, ${unusable}, 'staff', ${permsJson}::jsonb)
         returning id
       `;
     } else {
       created = await sql`
-        insert into tenant_users (tenant_id, email, password, role)
-        values (${auth.tenant_id}, ${email}, ${unusable}, 'staff')
+        insert into tenant_users (tenant_id, email, password, role, permissions)
+        values (${auth.tenant_id}, ${email}, ${unusable}, 'staff', ${permsJson}::jsonb)
         returning id
       `;
     }
@@ -602,7 +653,9 @@ export default async function handler(req, res) {
       let accountJson = null;
       let usageJson = null;
       let limitsJson = null;
-      if (account) {
+      const isStaffLogin = auth.role === 'staff';
+      // Staff never receive plan, limits or usage.
+      if (account && !isStaffLogin) {
         const usage = await getUsage(auth.tenant_id);
         accountJson = publicAccount(account);
         limitsJson = account.limits;
@@ -617,13 +670,34 @@ export default async function handler(req, res) {
         };
       }
 
+      // Staff get only what the dashboard needs to load: no email setup, and
+      // payment channels reduced to their names.
+      let settingsOut = s.rows[0] || null;
+      let tenantOut = t.rows[0] || null;
+      if (isStaffLogin) {
+        if (settingsOut) {
+          const pc = settingsOut.payment_channels && typeof settingsOut.payment_channels === 'object' ? settingsOut.payment_channels : {};
+          const slim = {};
+          Object.keys(pc).forEach((k) => {
+            slim[k] = { name: pc[k] && pc[k].name ? pc[k].name : undefined, enabled: !!(pc[k] && pc[k].enabled) };
+          });
+          settingsOut = { ...settingsOut, payment_channels: slim, email_config: null };
+        }
+        if (tenantOut) tenantOut = { ...tenantOut, plan: null };
+      }
+
       return res.status(200).json({
         ok: true,
-        tenant: t.rows[0] || null,
-        settings: s.rows[0] || null,
+        tenant: tenantOut,
+        settings: settingsOut,
         account: accountJson,
         limits: limitsJson,
         usage: usageJson,
+        // Who is asking and what they may do. Owners always get 'owner'.
+        me: {
+          role: isStaffLogin ? 'staff' : 'owner',
+          permissions: isStaffLogin ? auth.permissions : null,
+        },
       });
     }
 

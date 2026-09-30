@@ -1,6 +1,6 @@
 import { sql } from '@vercel/postgres';
 import { put } from '@vercel/blob';
-import { setCors, getAuth } from './_lib/helpers.js';
+import { setCors, getAuth, staffCannot } from './_lib/helpers.js';
 import { computeQuote } from './_lib/pricing.js';
 import { getAccount, countBookingsThisMonth, reserveStorage, releaseStorage } from './_lib/limits.js';
 import { recordFileOrRollback, linkFilesToBooking } from './_lib/storage.js';
@@ -198,6 +198,7 @@ export default async function handler(req, res) {
     if (!auth) {
       return res.status(401).json({ ok: false, error: 'Missing or invalid authorization token' });
     }
+    if (staffCannot(auth, res, 'bookings', 'view')) return;
     try {
       const result = await sql`
         SELECT * FROM bookings WHERE tenant_id = ${auth.tenant_id}
