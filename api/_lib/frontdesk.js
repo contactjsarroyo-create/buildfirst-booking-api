@@ -346,8 +346,15 @@ async function run(auth, body) {
     const amount = round2(body.amount);
     if (!(amount > 0) || amount > MAX_AMOUNT) return fail(400, 'Please enter an amount above zero.');
     const method = body.method ? String(body.method).trim().slice(0, 40) : null;
-    const b = await sql`select id from bookings where id = ${id} and tenant_id = ${tenantId}`;
-    if (b.rows.length === 0) return fail(404, 'Booking not found');
+    const b = await loadBooking(tenantId, id);
+    if (!b) return fail(404, 'Booking not found');
+    if (kind === 'payment') {
+      // Never take more than what is owed. This also stops the same money being
+      // recorded twice (once as "Mark as paid", once on the bill).
+      const owed = balanceOf(b);
+      if (owed <= 0.005) return fail(409, 'Nothing is owed on this booking. It is already paid.');
+      if (amount > owed + 0.005) return fail(409, 'That is more than the guest owes (' + owed.toFixed(2) + ').');
+    }
     await sql`
       insert into folio_items (tenant_id, booking_id, kind, description, amount, method)
       values (${tenantId}, ${id}, ${kind}, ${description}, ${amount}, ${method})

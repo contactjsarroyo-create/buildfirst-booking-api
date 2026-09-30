@@ -130,7 +130,8 @@ export async function getClosing(tenantId, from, to) {
       amount: round2(f.amount),
     });
   }
-  lines.sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
+  // Newest first.
+  lines.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
 
   const byMethod = {};
   for (const m of METHODS) byMethod[m.key] = { key: m.key, label: m.label, received: 0, refunded: 0, net: 0, count: 0 };

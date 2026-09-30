@@ -63,6 +63,28 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok: false, error: 'Provide a status, mark_paid, archived, seen, room_id and/or note' });
     }
 
+    // Never record the same money twice: if payments were already typed into the
+    // bill, "Mark as paid" would count the booking total on top of them.
+    if (mark_paid) {
+      const paidCheck = await sql`
+        select b.payment_status,
+               (select coalesce(sum(f.amount), 0) from folio_items f
+                 where f.booking_id = b.id and f.tenant_id = b.tenant_id
+                   and f.kind = 'payment' and f.voided_at is null) as bill_payments
+        from bookings b where b.id = ${id} and b.tenant_id = ${auth.tenant_id}
+      `;
+      if (paidCheck.rows.length === 0) {
+        return res.status(404).json({ ok: false, error: 'Booking not found' });
+      }
+      const pc = paidCheck.rows[0];
+      if (pc.payment_status !== 'paid' && Number(pc.bill_payments) > 0) {
+        return res.status(409).json({
+          ok: false,
+          error: 'Payments were already recorded on this booking\'s bill, so it can\'t also be marked as paid. Open the bill at the Front Desk to record the rest.',
+        });
+      }
+    }
+
     // Move the booking to another room. Nothing is changed unless the room
     // is free for every night of the stay. The price is not recalculated.
     if (room_id !== undefined) {
@@ -133,7 +155,7 @@ export default async function handler(req, res) {
         update bookings set
           status = ${status},
           payment_status = 'paid',
-          payment_confirmed_at = now()
+          payment_confirmed_at = case when payment_status = 'paid' and payment_confirmed_at is not null then payment_confirmed_at else now() end
         where id = ${id} and tenant_id = ${auth.tenant_id}
         returning id
       `;
@@ -147,7 +169,7 @@ export default async function handler(req, res) {
       result = await sql`
         update bookings set
           payment_status = 'paid',
-          payment_confirmed_at = now()
+          payment_confirmed_at = case when payment_status = 'paid' and payment_confirmed_at is not null then payment_confirmed_at else now() end
         where id = ${id} and tenant_id = ${auth.tenant_id}
         returning id
       `;
