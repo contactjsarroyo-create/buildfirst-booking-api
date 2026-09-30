@@ -186,6 +186,15 @@ export default async function handler(req, res) {
       });
       unitRows = unitRows.map((u) => ({ ...u, photos: photosByType[String(u.id)] || [] }));
 
+      // A room type with no active rooms can never be booked, so guests should not see it
+      // (it would show up as "not available" on every date, with no other dates to suggest).
+      const roomTypeRes = await sql`
+        select distinct unit_type_id::text as unit_type_id from rooms
+        where tenant_id = ${tenant.id} and is_active = true
+      `;
+      const typesWithRooms = new Set(roomTypeRes.rows.map((r) => r.unit_type_id));
+      unitRows = unitRows.filter((u) => typesWithRooms.has(String(u.id)));
+
       const windowDays = settings.booking_window_days ? Number(settings.booking_window_days) : 365;
       unavailable = await computeUnavailable(
         tenant.id,
