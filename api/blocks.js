@@ -1,5 +1,6 @@
 import { sql } from '@vercel/postgres';
 import { setCors, getAuth, staffCannot, text } from './_lib/helpers.js';
+import { getHousekeeping, housekeepingAction } from './_lib/housekeeping.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -9,6 +10,26 @@ export default async function handler(req, res) {
 
   const auth = await getAuth(req);
   if (!auth) return res.status(401).json({ ok: false, error: 'Unauthorized' });
+
+  // Housekeeping (rooms to clean, room problems, lost and found) lives here so
+  // it adds no serverless function. It has its own permission area.
+  if (req.query && req.query.resource === 'housekeeping') {
+    if (staffCannot(auth, res, 'housekeeping', req.method === 'GET' ? 'view' : 'edit')) return;
+    try {
+      if (req.method === 'GET') {
+        return res.status(200).json(await getHousekeeping(auth.tenant_id));
+      }
+      if (req.method === 'POST') {
+        const out = await housekeepingAction(auth, req.body);
+        return res.status(out.status).json(out.json);
+      }
+      return res.status(405).json({ ok: false, error: 'Method not allowed' });
+    } catch (err) {
+      console.error('housekeeping', err);
+      return res.status(500).json({ ok: false, error: 'Server error' });
+    }
+  }
+
   // Blocked dates live on the calendar, so they follow the Bookings setting.
   if (staffCannot(auth, res, 'bookings', req.method === 'GET' ? 'view' : 'edit')) return;
 

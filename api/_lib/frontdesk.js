@@ -102,8 +102,22 @@ export async function getFrontDesk(tenantId) {
     where tenant_id = ${tenantId} and start_date <= ${today}::date and end_date >= ${today}::date
   `;
 
+  // Open problems reported in Housekeeping, so the room board can say why a
+  // room is out of order. If the table is not there yet, carry on without it.
+  let openProblems = [];
+  try {
+    const pr = await sql`
+      select room_id::text as room_id, title from maintenance_requests
+      where tenant_id = ${tenantId} and status = 'open' order by created_at
+    `;
+    openProblems = pr.rows;
+  } catch (err) {
+    openProblems = [];
+  }
+
   const rooms = roomsResult.rows.map((r) => {
     const guest = inHouse.find((b) => b.room_id === r.id);
+    const problem = openProblems.find((p) => p.room_id === r.id);
     const blocked = blocksResult.rows.some(
       (bl) => bl.unit_type_id === r.unit_type_id && (!bl.room_ids || bl.room_ids.includes(r.id))
     );
@@ -122,6 +136,7 @@ export async function getFrontDesk(tenantId) {
       booking_id: guest ? guest.id : null,
       check_out: guest ? guest.check_out : null,
       arriving_name: arriving ? arriving.guest_name : null,
+      problem: problem ? problem.title : null,
     };
   });
 

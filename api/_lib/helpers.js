@@ -22,17 +22,23 @@ export function setCors(req, res, methods) {
 //   rooms     Rooms & Rates
 //   extras    Add-ons & Promos
 //   storage   Storage (view files, delete files)
+//   housekeeping  Housekeeping (rooms to clean, room problems, lost and found)
 // Payments, Booking Form, Automated Emails, Share & Embed, Account Settings,
 // the Staff tab and plans are ALWAYS owner only, whatever these say.
 // ------------------------------------------------------------
-export const PERMISSION_AREAS = ['bookings', 'rooms', 'extras', 'storage'];
+export const PERMISSION_AREAS = ['bookings', 'rooms', 'extras', 'storage', 'housekeeping'];
 const LEVEL_RANK = { none: 0, view: 1, edit: 2 };
+// Areas added after staff were first invited. A staff member whose permissions
+// were saved before the area existed gets 'none' for it, not 'edit'.
+const NEWER_AREAS = ['housekeeping'];
 
 export function normalizePermissions(input) {
   const out = {};
   const src = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  const hasStored = PERMISSION_AREAS.some((a) => LEVEL_RANK[src[a]] !== undefined);
   for (const area of PERMISSION_AREAS) {
-    out[area] = LEVEL_RANK[src[area]] !== undefined ? src[area] : 'edit';
+    if (LEVEL_RANK[src[area]] !== undefined) out[area] = src[area];
+    else out[area] = hasStored && NEWER_AREAS.includes(area) ? 'none' : 'edit';
   }
   return out;
 }
