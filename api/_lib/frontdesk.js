@@ -1,6 +1,7 @@
 import { sql } from '@vercel/postgres';
 import { computeQuote } from './pricing.js';
 import { getAccount, countBookingsThisMonth } from './limits.js';
+import { addGuestInfo, attachGuestToBooking } from './guests.js';
 
 // Front Desk: arrivals, in-house guests, check-in / check-out, folio (extra
 // charges and payments), room status, staff-entered walk-in bookings.
@@ -66,7 +67,7 @@ export async function getFrontDesk(tenantId) {
     select b.id, b.guest_name, b.guest_email, b.guest_phone,
            b.check_in::text as check_in, b.check_out::text as check_out,
            b.guests, b.special_requests, b.total_amount, b.payment_status, b.payment_channel,
-           b.status, b.source, b.room_id, b.unit_type_id, b.owner_note,
+           b.status, b.source, b.room_id, b.unit_type_id, b.owner_note, b.guest_id,
            b.checked_in_at, b.checked_out_at, b.guest_id_type, b.guest_id_number,
            coalesce(f.charges, 0) as folio_charges,
            coalesce(f.payments, 0) as folio_payments,
@@ -87,7 +88,10 @@ export async function getFrontDesk(tenantId) {
       )
     order by b.check_in, b.guest_name
   `;
-  const rows = result.rows.map((r) => ({ ...r, balance_due: balanceOf(r) }));
+  const rows = await addGuestInfo(
+    tenantId,
+    result.rows.map((r) => ({ ...r, balance_due: balanceOf(r) }))
+  );
   const inHouse = rows.filter((r) => r.checked_in_at);
   const arrivals = rows.filter((r) => !r.checked_in_at);
 
@@ -430,6 +434,9 @@ async function walkIn(auth, body) {
     returning id
   `;
   const bookingId = inserted.rows[0].id;
+
+  // Link the walk-in to a guest profile (a returning guest is matched by phone).
+  await attachGuestToBooking(tenantId, bookingId, { name: guestName, email: guestEmail, phone: guestPhone });
 
   let checkInError = '';
   if (body.check_in_now === true && checkIn === today) {

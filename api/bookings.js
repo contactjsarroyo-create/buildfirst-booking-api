@@ -6,6 +6,7 @@ import { getAccount, countBookingsThisMonth, reserveStorage, releaseStorage } fr
 import { recordFileOrRollback, linkFilesToBooking } from './_lib/storage.js';
 import { sendBookingCreatedEmails, withTimeout } from './_lib/bookingemails.js';
 import { getFrontDesk, getFolio } from './_lib/frontdesk.js';
+import { listGuests, getGuest, addGuestInfo, attachGuestToBooking } from './_lib/guests.js';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -210,10 +211,40 @@ export default async function handler(req, res) {
         const f = await getFolio(auth.tenant_id, req.query.booking_id);
         return res.status(f.status).json(f.json);
       }
-      const result = await sql`
-        SELECT * FROM bookings WHERE tenant_id = ${auth.tenant_id}
-      `;
-      return res.status(200).json({ ok: true, bookings: result.rows });
+      // Guest records reads (same route, no new function file).
+      if (resource === 'guests') {
+        return res.status(200).json(await listGuests(auth.tenant_id));
+      }
+      if (resource === 'guest') {
+        const g = await getGuest(auth.tenant_id, req.query.id);
+        return res.status(g.status).json(g.json);
+      }
+      // The bookings list, with a little guest history on each booking (repeat
+      // guest, blacklist). If the guests table is not there yet, fall back to
+      // the plain list so the dashboard keeps working.
+      let rows;
+      try {
+        const enriched = await sql`
+          SELECT b.*,
+                 g.is_blacklisted AS guest_blacklisted,
+                 g.blacklist_reason AS guest_blacklist_reason,
+                 (SELECT count(*) FROM bookings x
+                   WHERE x.tenant_id = b.tenant_id AND x.guest_id = b.guest_id AND x.id <> b.id
+                     AND x.check_in < b.check_in
+                     AND x.status = 'confirmed' AND x.no_show_at IS NULL)::int AS guest_earlier_stays
+          FROM bookings b
+          LEFT JOIN guests g ON g.id = b.guest_id AND g.tenant_id = b.tenant_id
+          WHERE b.tenant_id = ${auth.tenant_id}
+        `;
+        rows = enriched.rows;
+      } catch (enrichErr) {
+        console.error('bookings list without guest info', enrichErr && enrichErr.message);
+        const plain = await sql`
+          SELECT * FROM bookings WHERE tenant_id = ${auth.tenant_id}
+        `;
+        rows = plain.rows;
+      }
+      return res.status(200).json({ ok: true, bookings: rows });
     } catch (err) {
       console.error(err);
       return res.status(500).json({ ok: false, error: 'Server error' });
@@ -330,6 +361,14 @@ export default async function handler(req, res) {
         RETURNING *
       `;
       const booking = result.rows[0];
+
+      // Link the booking to the guest's profile (creates one for a new guest).
+      // Best effort: never fails the booking.
+      await attachGuestToBooking(b.tenant_id, booking.id, {
+        name: guest_name,
+        email: guest_email,
+        phone: guest_phone,
+      });
 
       // Tie any guest photos in this booking to it (used for the retention
       // clock). Best effort: a failure here must never lose the booking.

@@ -4,6 +4,7 @@ import { setCors, getAuth, staffCannot } from './_lib/helpers.js';
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 import { sendBookingConfirmedEmail, withTimeout } from './_lib/bookingemails.js';
 import { frontDeskAction } from './_lib/frontdesk.js';
+import { guestAction, GUEST_ACTIONS } from './_lib/guests.js';
 
 export default async function handler(req, res) {
   if (setCors(req, res, 'PATCH, OPTIONS')) return;
@@ -16,6 +17,12 @@ export default async function handler(req, res) {
   // Every change here (confirm, cancel, paid, archive, seen, room, note) needs
   // Bookings "edit" for staff.
   if (staffCannot(auth, res, 'bookings', 'edit')) return;
+
+  // Guest record actions (edit profile, notes, blacklist, merge).
+  if (req.body && GUEST_ACTIONS.includes(req.body.action)) {
+    const r = await guestAction(auth, req.body);
+    return res.status(r.status).json(r.json);
+  }
 
   // Front Desk actions (check in / out, folio, walk-in, room status).
   if (req.body && req.body.action) {
