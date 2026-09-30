@@ -98,6 +98,40 @@ export async function getFrontDesk(tenantId) {
   const inHouse = rows.filter((r) => r.checked_in_at);
   const arrivals = rows.filter((r) => !r.checked_in_at);
 
+  // Guests who have left in the last 30 days (newest first), so the desk can
+  // still open their bill or statement.
+  const tzRow = await sql`select timezone from tenants where id = ${tenantId}`;
+  const tz = (tzRow.rows[0] && tzRow.rows[0].timezone) || 'Asia/Manila';
+  const outResult = await sql`
+    select b.id, b.guest_name, b.guest_email, b.guest_phone,
+           b.check_in::text as check_in, b.check_out::text as check_out,
+           b.guests, b.special_requests, b.total_amount, b.payment_status, b.payment_channel,
+           b.status, b.source, b.room_id, b.unit_type_id, b.owner_note, b.guest_id,
+           b.checked_in_at, b.checked_out_at, b.guest_id_type, b.guest_id_number,
+           (b.checked_out_at at time zone ${tz})::date::text as checked_out_day,
+           coalesce(f.charges, 0) as folio_charges,
+           coalesce(f.payments, 0) as folio_payments,
+           coalesce(f.refunds, 0) as folio_refunds,
+           coalesce(f.discounts, 0) as folio_discounts
+    from bookings b
+    left join lateral (
+      select sum(amount) filter (where kind = 'charge') as charges,
+             sum(amount) filter (where kind = 'payment') as payments,
+             sum(amount) filter (where kind = 'refund') as refunds,
+             sum(amount) filter (where kind = 'discount') as discounts
+      from folio_items where booking_id = b.id and voided_at is null
+    ) f on true
+    where b.tenant_id = ${tenantId}
+      and b.checked_out_at is not null
+      and b.checked_out_at >= now() - interval '30 days'
+    order by b.checked_out_at desc
+    limit 100
+  `;
+  const checkedOut = await addGuestInfo(
+    tenantId,
+    outResult.rows.map((r) => ({ ...r, balance_due: balanceOf(r) }))
+  );
+
   const roomsResult = await sql`
     select r.id, r.label, r.unit_type_id, r.housekeeping_status, ut.name as type_name
     from rooms r join unit_types ut on ut.id = r.unit_type_id
@@ -147,7 +181,7 @@ export async function getFrontDesk(tenantId) {
     };
   });
 
-  return { ok: true, today, arrivals, in_house: inHouse, rooms };
+  return { ok: true, today, arrivals, in_house: inHouse, checked_out: checkedOut, rooms };
 }
 
 export async function getFolio(tenantId, bookingId) {
