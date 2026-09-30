@@ -1,7 +1,7 @@
 import { sql } from '@vercel/postgres';
 import { put } from '@vercel/blob';
 import { setCors, getAuth, num, text } from './_lib/helpers.js';
-import { getAccount, getUsage, planLimit, reserveStorage, releaseStorage } from './_lib/limits.js';
+import { getAccount, getUsage, planLimit, blocked, reserveStorage, releaseStorage } from './_lib/limits.js';
 import { recordFileOrRollback, removeFiles, isUuid } from './_lib/storage.js';
 
 
@@ -119,6 +119,8 @@ export default async function handler(req, res) {
       const limits = account.limits;
 
       if (req.method === 'POST') {
+        // Expired trial or inactive account: nothing new can be added.
+        if (!account.can_book) return blocked(res, account);
         // Only active room types and rooms count toward the plan limits, so a
         // room type created as inactive is never checked.
         if (active) {
@@ -289,6 +291,7 @@ async function handleRooms(req, res, auth) {
     // Plan limit on the total number of individual rooms.
     const account = await getAccount(auth.tenant_id);
     if (!account) return res.status(404).json({ ok: false, error: 'Account not found' });
+    if (!account.can_book) return blocked(res, account);
     // Only active rooms inside active room types count. A new room in an
     // inactive room type is not checked until that room type is turned on.
     const typeActive = await sql`
@@ -439,6 +442,7 @@ async function handlePhotos(req, res, auth) {
 
     const account = await getAccount(auth.tenant_id);
     if (!account) return res.status(404).json({ ok: false, error: 'Account not found' });
+    if (!account.can_book) return blocked(res, account);
 
     const parsed = parsePhotoDataUrl(b.image_base64);
     if (!parsed) {
