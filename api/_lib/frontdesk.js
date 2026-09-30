@@ -432,11 +432,11 @@ async function walkIn(auth, body) {
     insert into bookings (
       tenant_id, unit_type_id, room_id, guest_name, guest_email, guest_phone,
       check_in, check_out, guests, base_amount, addons_amount, vat_amount,
-      discount_amount, total_amount, source, status
+      discount_amount, total_amount, source, status, seen_at
     ) values (
       ${tenantId}, ${q.unit_type_id}, ${roomId}, ${guestName}, ${guestEmail}, ${guestPhone},
       ${q.check_in}, ${q.check_out}, ${q.guests}, ${q.base_amount}, 0, ${q.vat_amount},
-      0, ${q.total_amount}, 'walk_in', 'confirmed'
+      0, ${q.total_amount}, 'walk_in', 'confirmed', now()
     )
     returning id
   `;
