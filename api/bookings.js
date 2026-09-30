@@ -5,6 +5,7 @@ import { computeQuote } from './_lib/pricing.js';
 import { getAccount, countBookingsThisMonth, reserveStorage, releaseStorage } from './_lib/limits.js';
 import { recordFileOrRollback, linkFilesToBooking } from './_lib/storage.js';
 import { sendBookingCreatedEmails, withTimeout } from './_lib/bookingemails.js';
+import { getFrontDesk, getFolio } from './_lib/frontdesk.js';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -200,6 +201,15 @@ export default async function handler(req, res) {
     }
     if (staffCannot(auth, res, 'bookings', 'view')) return;
     try {
+      // Front Desk reads (same route, no new function file).
+      const resource = req.query && req.query.resource;
+      if (resource === 'frontdesk') {
+        return res.status(200).json(await getFrontDesk(auth.tenant_id));
+      }
+      if (resource === 'folio') {
+        const f = await getFolio(auth.tenant_id, req.query.booking_id);
+        return res.status(f.status).json(f.json);
+      }
       const result = await sql`
         SELECT * FROM bookings WHERE tenant_id = ${auth.tenant_id}
       `;

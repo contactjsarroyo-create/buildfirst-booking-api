@@ -137,6 +137,7 @@ export async function computeQuote(input) {
     WHERE unit_type_id = ${unit_type_id}
       AND tenant_id = ${tenant_id}
       AND status = 'confirmed'
+      AND checked_out_at IS NULL
       AND room_id IS NOT NULL
       AND check_in < ${check_out}::date
       AND check_out > ${check_in}::date
