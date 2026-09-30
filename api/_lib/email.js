@@ -132,3 +132,27 @@ export function resetEmail(link) {
       `This link expires in 1 hour and can only be used once. If you did not ask for this, you can ignore this email and your password will stay the same.`,
   };
 }
+
+function esc(v) {
+  return String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// Sent when an owner adds a staff login. The link opens the same page as
+// "reset password", where the person chooses their own password.
+export function staffInviteEmail(link, resortName) {
+  const name = String(resortName || 'a resort').slice(0, 100);
+  return {
+    subject: `You have been invited to ${name} on Buildfirst`,
+    html: layout(
+      `Join ${esc(name)}`,
+      `You have been invited to help manage bookings for ${esc(name)}. Tap the button below to choose your password and log in.`,
+      'Choose my password',
+      link,
+      'This link expires in 7 days and can only be used once. If you were not expecting this, you can ignore this email.'
+    ),
+    text:
+      `You have been invited to ${name} on Buildfirst\n\n` +
+      `You have been invited to help manage bookings for ${name}. Open this link to choose your password and log in:\n${link}\n\n` +
+      `This link expires in 7 days and can only be used once. If you were not expecting this, you can ignore this email.`,
+  };
+}

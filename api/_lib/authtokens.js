@@ -14,9 +14,10 @@ export function hashToken(raw) {
 
 // Creates a fresh token for a user and invalidates their older unused ones.
 // Returns { token } or { throttled: true } if one was issued under a minute ago.
-export async function issueToken(userId, purpose) {
+// ttlMinutes is optional and overrides the default lifetime (staff invites last 7 days).
+export async function issueToken(userId, purpose, ttlMinutes) {
   const uid = String(userId);
-  const ttl = TTL_MINUTES[purpose];
+  const ttl = ttlMinutes || TTL_MINUTES[purpose];
   if (!ttl) throw new Error(`Unknown token purpose: ${purpose}`);
 
   const recent = await sql`

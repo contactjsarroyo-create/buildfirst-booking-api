@@ -486,8 +486,10 @@ export async function sendBookingConfirmedEmail(tenantId, bookingId) {
     if (!booking || booking.status !== 'confirmed' || booking.confirmed_email_sent_at) return false;
     if (!validEmail(booking.guest_email)) return false;
 
+    // A booking made during the trial can still be confirmed after it ends.
+    // Only accounts that are switched off send nothing.
     const account = await getAccount(tenantId);
-    if (!account || !account.can_book) return false;
+    if (!account || account.state === 'inactive') return false;
 
     const ctx = await loadContext(tenantId, booking);
     if (ctx.config.guest_confirmed === false) return false;

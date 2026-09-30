@@ -1,6 +1,9 @@
 import { sql } from '@vercel/postgres';
 import { put } from '@vercel/blob';
-import { setCors, getAuth, num, text } from './_lib/helpers.js';
+import { setCors, getAuth, staffBlocked, num, text } from './_lib/helpers.js';
+import crypto from 'crypto';
+import { issueToken } from './_lib/authtokens.js';
+import { sendEmail, appLink, staffInviteEmail } from './_lib/email.js';
 import {
   getAccount,
   getUsage,
@@ -339,6 +342,7 @@ async function handleStorage(req, res, auth) {
   }
 
   if (req.method === 'PUT') {
+    if (staffBlocked(auth, res)) return;
     const days = Number((req.body || {}).image_retention_days);
     if (!RETENTION_OPTIONS.includes(days)) {
       return res.status(400).json({
@@ -367,10 +371,11 @@ async function handleStorage(req, res, auth) {
 // The cleaning rules live in _lib/emailcore.js.
 // ------------------------------------------------------------
 async function handleEmails(req, res, auth) {
+  if (staffBlocked(auth, res)) return;
   if (req.method === 'GET') {
     const t = await sql`select name from tenants where id = ${auth.tenant_id}`;
     const s = await sql`select logo_url, primary_color, email_config from tenant_settings where tenant_id = ${auth.tenant_id}`;
-    const owner = await sql`select email from tenant_users where tenant_id = ${auth.tenant_id} limit 1`;
+    const owner = await sql`select email from tenant_users where tenant_id = ${auth.tenant_id} and role is distinct from 'staff' limit 1`;
     const account = await getAccount(auth.tenant_id);
     let emailsUsed = null;
     if (account) {
@@ -418,10 +423,153 @@ async function handleEmails(req, res, auth) {
   return res.status(405).json({ ok: false, error: 'Method not allowed' });
 }
 
+// ------------------------------------------------------------
+// Staff logins (owner only). Reached via /api/settings?resource=staff
+// (merged here to stay under Vercel's 12-function cap).
+//   GET     owner email, staff list, how many are used, the plan limit
+//   POST    { email }              invite a new staff login
+//   POST    { action:'resend', id } send the invite again
+//   DELETE  &id=<user id>          remove a staff login
+// A staff login is a tenant_users row with role 'staff' and a password
+// nobody knows. The invite link opens the "choose a new password" screen.
+// ------------------------------------------------------------
+const INVITE_TTL_MINUTES = 7 * 24 * 60;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+async function passwordColumn() {
+  const r = await sql`
+    select column_name from information_schema.columns
+    where table_name = 'tenant_users' and column_name in ('password_hash', 'password')
+  `;
+  const names = r.rows.map((x) => x.column_name);
+  if (names.includes('password_hash')) return 'password_hash';
+  if (names.includes('password')) return 'password';
+  return null;
+}
+
+async function sendInvite(userId, email, tenantId) {
+  const t = await sql`select name from tenants where id = ${tenantId}`;
+  const resortName = (t.rows[0] && t.rows[0].name) || 'a resort';
+  const issued = await issueToken(userId, 'reset', INVITE_TTL_MINUTES);
+  if (issued.throttled) return { ok: false, throttled: true };
+  const mail = staffInviteEmail(appLink({ reset: issued.token }), resortName);
+  const sent = await sendEmail({ to: email, subject: mail.subject, html: mail.html, text: mail.text });
+  return sent.ok ? { ok: true } : { ok: false, error: sent.error };
+}
+
+async function handleStaff(req, res, auth) {
+  if (staffBlocked(auth, res)) return;
+
+  const account = await getAccount(auth.tenant_id);
+  if (!account) return res.status(404).json({ ok: false, error: 'Account not found' });
+
+  if (req.method === 'GET') {
+    const owner = await sql`
+      select email from tenant_users
+      where tenant_id = ${auth.tenant_id} and role is distinct from 'staff' limit 1
+    `;
+    const staff = await sql`
+      select u.id, u.email,
+        (u.email_verified_at is not null) as accepted
+      from tenant_users u
+      where u.tenant_id = ${auth.tenant_id} and u.role = 'staff'
+      order by u.email
+    `;
+    return res.status(200).json({
+      ok: true,
+      owner_email: (owner.rows[0] && owner.rows[0].email) || '',
+      staff: staff.rows.map((r) => ({ id: String(r.id), email: r.email, accepted: !!r.accepted })),
+      used: staff.rows.length,
+      limit: account.limits.staff_logins,
+    });
+  }
+
+  if (req.method === 'POST') {
+    const b = req.body || {};
+
+    if (b.action === 'resend') {
+      const u = await sql`
+        select id, email, email_verified_at from tenant_users
+        where id::text = ${String(b.id || '')} and tenant_id = ${auth.tenant_id} and role = 'staff'
+      `;
+      if (u.rows.length === 0) return res.status(404).json({ ok: false, error: 'That person was not found.' });
+      if (u.rows[0].email_verified_at) {
+        return res.status(400).json({ ok: false, error: 'This person already has a password. They can use "Forgot password" on the login page if needed.' });
+      }
+      const r = await sendInvite(u.rows[0].id, u.rows[0].email, auth.tenant_id);
+      if (r.throttled) return res.status(429).json({ ok: false, error: 'An invite was just sent. Please wait a minute before sending another.' });
+      if (!r.ok) return res.status(502).json({ ok: false, error: 'The invite email could not be sent. Please try again in a moment.' });
+      return res.status(200).json({ ok: true });
+    }
+
+    if (!account.can_book) return blocked(res, account);
+
+    const email = String(b.email || '').trim().toLowerCase();
+    if (!EMAIL_RE.test(email) || email.length > 200) {
+      return res.status(400).json({ ok: false, error: 'Please enter a valid email address.' });
+    }
+
+    const usage = await getUsage(auth.tenant_id);
+    if (usage.staff_logins >= account.limits.staff_logins) {
+      return planLimit(
+        res,
+        account,
+        `Your ${account.label} includes ${account.limits.staff_logins} staff login${account.limits.staff_logins === 1 ? '' : 's'} and you are using all of them.`,
+        'staff_logins'
+      );
+    }
+
+    const exists = await sql`select 1 from tenant_users where lower(email) = ${email} limit 1`;
+    if (exists.rows.length > 0) {
+      return res.status(409).json({ ok: false, error: 'That email already has a login. Please use a different email address.' });
+    }
+
+    const col = await passwordColumn();
+    if (!col) return res.status(500).json({ ok: false, error: 'Server error' });
+    const unusable = '!invite!' + crypto.randomBytes(24).toString('hex');
+    let created;
+    if (col === 'password_hash') {
+      created = await sql`
+        insert into tenant_users (tenant_id, email, password_hash, role)
+        values (${auth.tenant_id}, ${email}, ${unusable}, 'staff')
+        returning id
+      `;
+    } else {
+      created = await sql`
+        insert into tenant_users (tenant_id, email, password, role)
+        values (${auth.tenant_id}, ${email}, ${unusable}, 'staff')
+        returning id
+      `;
+    }
+    const id = created.rows[0].id;
+    const r = await sendInvite(id, email, auth.tenant_id);
+    return res.status(200).json({
+      ok: true,
+      id: String(id),
+      email_sent: !!r.ok,
+      note: r.ok ? null : 'The login was added but the invite email could not be sent. Use "Send invite again".',
+    });
+  }
+
+  if (req.method === 'DELETE') {
+    const id = String((req.query && req.query.id) || '');
+    const u = await sql`
+      select id from tenant_users
+      where id::text = ${id} and tenant_id = ${auth.tenant_id} and role = 'staff'
+    `;
+    if (u.rows.length === 0) return res.status(404).json({ ok: false, error: 'That person was not found.' });
+    await sql`delete from auth_tokens where user_id = ${String(u.rows[0].id)}`;
+    await sql`delete from tenant_users where id = ${u.rows[0].id} and tenant_id = ${auth.tenant_id}`;
+    return res.status(200).json({ ok: true });
+  }
+
+  return res.status(405).json({ ok: false, error: 'Method not allowed' });
+}
+
 export default async function handler(req, res) {
   if (setCors(req, res, 'GET, PUT, POST, DELETE, OPTIONS')) return;
 
-  const auth = getAuth(req);
+  const auth = await getAuth(req);
   if (!auth) return res.status(401).json({ ok: false, error: 'Unauthorized' });
 
   try {
@@ -430,6 +578,9 @@ export default async function handler(req, res) {
     }
     if (req.query && req.query.resource === 'emails') {
       return await handleEmails(req, res, auth);
+    }
+    if (req.query && req.query.resource === 'staff') {
+      return await handleStaff(req, res, auth);
     }
 
     if (req.method === 'GET') {
@@ -462,6 +613,7 @@ export default async function handler(req, res) {
           bookings_this_month: usage.bookings_this_month,
           storage_bytes: usage.storage_bytes,
           emails_this_month: usage.emails_this_month,
+          staff_logins: usage.staff_logins,
         };
       }
 
@@ -476,6 +628,7 @@ export default async function handler(req, res) {
     }
 
     if (req.method === 'PUT') {
+      if (staffBlocked(auth, res)) return;
       const b = req.body || {};
       const name = text(b.name);
       const vals = {
@@ -628,6 +781,7 @@ export default async function handler(req, res) {
     }
 
     if (req.method === 'POST') {
+      if (staffBlocked(auth, res)) return;
       // Reference-image upload for a custom question. auth is already
       // required above for every method on this endpoint.
       const b = req.body || {};

@@ -8,7 +8,7 @@ export default async function handler(req, res) {
     return res.status(405).json({ ok: false, error: 'Method not allowed' });
   }
 
-  const auth = getAuth(req);
+  const auth = await getAuth(req);
   if (!auth) return res.status(401).json({ ok: false, error: 'Unauthorized' });
 
   try {

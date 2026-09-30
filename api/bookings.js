@@ -194,7 +194,7 @@ export default async function handler(req, res) {
   if (setCors(req, res, 'GET, POST, OPTIONS')) return;
 
   if (req.method === 'GET') {
-    const auth = getAuth(req);
+    const auth = await getAuth(req);
     if (!auth) {
       return res.status(401).json({ ok: false, error: 'Missing or invalid authorization token' });
     }

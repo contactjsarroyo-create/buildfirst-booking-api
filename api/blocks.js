@@ -7,7 +7,7 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 export default async function handler(req, res) {
   if (setCors(req, res, 'GET, POST, DELETE, OPTIONS')) return;
 
-  const auth = getAuth(req);
+  const auth = await getAuth(req);
   if (!auth) return res.status(401).json({ ok: false, error: 'Unauthorized' });
 
   try {

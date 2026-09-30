@@ -44,7 +44,7 @@ async function createRoomsForType(tenantId, unitTypeId, name, count) {
 export default async function handler(req, res) {
   if (setCors(req, res, 'GET, POST, PUT, DELETE, OPTIONS')) return;
 
-  const auth = getAuth(req);
+  const auth = await getAuth(req);
   if (!auth) return res.status(401).json({ ok: false, error: 'Unauthorized' });
 
   const rq = req.query && req.query.resource;

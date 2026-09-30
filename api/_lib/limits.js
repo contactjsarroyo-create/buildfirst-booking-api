@@ -15,15 +15,16 @@ import { sql } from '@vercel/postgres';
 //                       monthly booking cap (3 emails per booking: owner alert,
 //                       guest "received", guest "confirmed", plus one spare
 //                       for test emails and resends).
-// Not enforced yet (nothing to enforce): staff logins.
+//   staff_logins        extra logins on top of the owner (role 'staff', invited
+//                       ones count too).
 // ------------------------------------------------------------
 const MB = 1024 * 1024;
 const GB = 1024 * MB;
 
 export const PLAN_LIMITS = {
-  starter: { unit_types: 3, rooms: 10, bookings_per_month: 75, storage_bytes: 50 * MB, custom_fields: 5, emails: 300 },
-  growth: { unit_types: 10, rooms: 40, bookings_per_month: 300, storage_bytes: 250 * MB, custom_fields: 15, emails: 1200 },
-  pro: { unit_types: 25, rooms: 100, bookings_per_month: 1000, storage_bytes: 1 * GB, custom_fields: 40, emails: 4000 },
+  starter: { unit_types: 3, rooms: 10, bookings_per_month: 75, storage_bytes: 50 * MB, custom_fields: 5, emails: 300, staff_logins: 1 },
+  growth: { unit_types: 10, rooms: 40, bookings_per_month: 300, storage_bytes: 250 * MB, custom_fields: 15, emails: 1200, staff_logins: 3 },
+  pro: { unit_types: 25, rooms: 100, bookings_per_month: 1000, storage_bytes: 1 * GB, custom_fields: 40, emails: 4000, staff_logins: 10 },
 };
 
 // Trials always run on the cheapest plan's limits, whatever plan was picked at signup.
@@ -115,7 +116,9 @@ export async function getUsage(tenantId) {
       ) as bookings_this_month,
       (select storage_bytes::float8 from tenants where id = ${tenantId}) as storage_bytes,
       (select case when jsonb_typeof(custom_fields) = 'array' then jsonb_array_length(custom_fields) else 0 end
-         from tenant_settings where tenant_id = ${tenantId}) as custom_fields
+         from tenant_settings where tenant_id = ${tenantId}) as custom_fields,
+      (select count(*)::int from tenant_users
+         where tenant_id = ${tenantId} and role = 'staff') as staff_logins
   `;
   const u = r.rows[0] || {};
   const emailsThisMonth = await countEmailsThisMonth(tenantId);
@@ -126,6 +129,7 @@ export async function getUsage(tenantId) {
     bookings_this_month: u.bookings_this_month || 0,
     storage_bytes: Number(u.storage_bytes) || 0,
     custom_fields: u.custom_fields || 0,
+    staff_logins: u.staff_logins || 0,
     emails_this_month: emailsThisMonth,
   };
 }
