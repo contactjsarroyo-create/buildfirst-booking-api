@@ -23,14 +23,16 @@ export function setCors(req, res, methods) {
 //   extras    Add-ons & Promos
 //   storage   Storage (view files, delete files)
 //   housekeeping  Housekeeping (rooms to clean, room problems, lost and found)
+//   money     Money (daily closing report; later expenses). A statement of
+//             account for one booking only needs Bookings view.
 // Payments, Booking Form, Automated Emails, Share & Embed, Account Settings,
 // the Staff tab and plans are ALWAYS owner only, whatever these say.
 // ------------------------------------------------------------
-export const PERMISSION_AREAS = ['bookings', 'rooms', 'extras', 'storage', 'housekeeping'];
+export const PERMISSION_AREAS = ['bookings', 'rooms', 'extras', 'storage', 'housekeeping', 'money'];
 const LEVEL_RANK = { none: 0, view: 1, edit: 2 };
 // Areas added after staff were first invited. A staff member whose permissions
 // were saved before the area existed gets 'none' for it, not 'edit'.
-const NEWER_AREAS = ['housekeeping'];
+const NEWER_AREAS = ['housekeeping', 'money'];
 
 export function normalizePermissions(input) {
   const out = {};

@@ -7,6 +7,7 @@ import { recordFileOrRollback, linkFilesToBooking } from './_lib/storage.js';
 import { sendBookingCreatedEmails, withTimeout } from './_lib/bookingemails.js';
 import { getFrontDesk, getFolio } from './_lib/frontdesk.js';
 import { listGuests, getGuest, addGuestInfo, attachGuestToBooking } from './_lib/guests.js';
+import { getClosing, getStatement } from './_lib/money.js';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -200,10 +201,26 @@ export default async function handler(req, res) {
     if (!auth) {
       return res.status(401).json({ ok: false, error: 'Missing or invalid authorization token' });
     }
+    const resource = req.query && req.query.resource;
+    // The closing report shows all the money, so it has its own permission area.
+    if (resource === 'closing') {
+      if (staffCannot(auth, res, 'money', 'view')) return;
+      try {
+        const c = await getClosing(auth.tenant_id, req.query.from, req.query.to || req.query.from);
+        return res.status(c.status).json(c.json);
+      } catch (err) {
+        console.error(err);
+        return res.status(500).json({ ok: false, error: 'Server error' });
+      }
+    }
     if (staffCannot(auth, res, 'bookings', 'view')) return;
     try {
+      // Statement of account for one booking (printable, not an official receipt).
+      if (resource === 'statement') {
+        const st = await getStatement(auth.tenant_id, req.query.booking_id);
+        return res.status(st.status).json(st.json);
+      }
       // Front Desk reads (same route, no new function file).
-      const resource = req.query && req.query.resource;
       if (resource === 'frontdesk') {
         return res.status(200).json(await getFrontDesk(auth.tenant_id));
       }
