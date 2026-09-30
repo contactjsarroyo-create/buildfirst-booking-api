@@ -8,6 +8,7 @@ import { sendBookingCreatedEmails, withTimeout } from './_lib/bookingemails.js';
 import { getFrontDesk, getFolio } from './_lib/frontdesk.js';
 import { listGuests, getGuest, addGuestInfo, attachGuestToBooking } from './_lib/guests.js';
 import { getClosing, getStatement, getExpenses } from './_lib/money.js';
+import { getAnalytics } from './_lib/analytics.js';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -219,6 +220,17 @@ export default async function handler(req, res) {
       try {
         const x = await getExpenses(auth.tenant_id, req.query.from, req.query.to || req.query.from);
         return res.status(x.status).json(x.json);
+      } catch (err) {
+        console.error(err);
+        return res.status(500).json({ ok: false, error: 'Server error' });
+      }
+    }
+    // Analytics shows income, so it follows the Money permission too.
+    if (resource === 'analytics') {
+      if (staffCannot(auth, res, 'money', 'view')) return;
+      try {
+        const a = await getAnalytics(auth.tenant_id, req.query.from, req.query.to || req.query.from);
+        return res.status(a.status).json(a.json);
       } catch (err) {
         console.error(err);
         return res.status(500).json({ ok: false, error: 'Server error' });
