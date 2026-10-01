@@ -6,6 +6,7 @@ import { sendBookingConfirmedEmail, withTimeout } from './_lib/bookingemails.js'
 import { frontDeskAction } from './_lib/frontdesk.js';
 import { guestAction, GUEST_ACTIONS } from './_lib/guests.js';
 import { moneyAction, MONEY_ACTIONS } from './_lib/money.js';
+import { onlineDepositAction, ONLINE_DEPOSIT_ACTIONS } from './_lib/onlinedeposit.js';
 
 export default async function handler(req, res) {
   if (setCors(req, res, 'PATCH, OPTIONS')) return;
@@ -31,6 +32,22 @@ export default async function handler(req, res) {
   if (req.body && GUEST_ACTIONS.includes(req.body.action)) {
     const r = await guestAction(auth, req.body);
     return res.status(r.status).json(r.json);
+  }
+
+  // The guest's online deposit has arrived. Records it on the bill, then sends
+  // the guest their confirmation email (once, like Mark as paid does).
+  if (req.body && ONLINE_DEPOSIT_ACTIONS.includes(req.body.action)) {
+    try {
+      const r = await onlineDepositAction(auth, req.body);
+      if (r.status === 200) {
+        r.json.guest_emailed =
+          (await withTimeout(sendBookingConfirmedEmail(auth.tenant_id, req.body.id))) === true;
+      }
+      return res.status(r.status).json(r.json);
+    } catch (err) {
+      console.error(err);
+      return res.status(500).json({ ok: false, error: 'Server error' });
+    }
   }
 
   // Front Desk actions (check in / out, folio, walk-in, room status).

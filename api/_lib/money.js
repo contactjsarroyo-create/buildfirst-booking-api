@@ -80,6 +80,34 @@ function todayIn(timezone) {
 // Everything is optional. A resort that changes nothing behaves as before:
 // VAT on, no service charge, no deposits.
 // ------------------------------------------------------------
+const ONLINE_OFF = {
+  online_deposit_enabled: false, online_deposit_kind: 'percent', online_deposit_percent: 30,
+  online_deposit_fixed: 0, online_deposit_policy: '',
+};
+
+// The online deposit option is read on its own, so a resort whose database has
+// not had the Batch 2 migration yet still loads every other money setting.
+async function getOnlineDepositSettings(tenantId) {
+  try {
+    const r = await sql`
+      select online_deposit_enabled, online_deposit_kind, online_deposit_percent,
+             online_deposit_fixed, online_deposit_policy
+      from tenant_settings where tenant_id = ${tenantId}
+    `;
+    const s = r.rows[0];
+    if (!s) return { ...ONLINE_OFF };
+    return {
+      online_deposit_enabled: s.online_deposit_enabled === true,
+      online_deposit_kind: s.online_deposit_kind === 'fixed' ? 'fixed' : 'percent',
+      online_deposit_percent: s.online_deposit_percent === null ? 30 : Number(s.online_deposit_percent),
+      online_deposit_fixed: s.online_deposit_fixed === null ? 0 : Number(s.online_deposit_fixed),
+      online_deposit_policy: String(s.online_deposit_policy || ''),
+    };
+  } catch (err) {
+    return { ...ONLINE_OFF };
+  }
+}
+
 export async function getMoneySettings(tenantId) {
   const r = await sql`
     select vat_percent, vat_registered, service_charge_enabled, service_charge_percent,
@@ -92,10 +120,12 @@ export async function getMoneySettings(tenantId) {
       has_settings: false, vat_registered: true, vat_percent: 12,
       service_charge_enabled: false, service_charge_percent: 10,
       deposit_enabled: false, deposit_kind: 'percent', deposit_percent: 0, deposit_fixed: 0,
+      ...ONLINE_OFF,
     };
   }
   return {
     has_settings: true,
+    ...(await getOnlineDepositSettings(tenantId)),
     vat_registered: s.vat_registered !== false,
     vat_percent: s.vat_percent === null || s.vat_percent === undefined ? 12 : Number(s.vat_percent),
     service_charge_enabled: s.service_charge_enabled === true,
@@ -135,6 +165,23 @@ export async function saveMoneySettings(tenantId, input) {
   if (depEnabled && depKind === 'percent' && !(depPercent > 0)) return fail(400, 'Enter the deposit percent, or turn deposits off.');
   if (depEnabled && depKind === 'fixed' && !(depFixed > 0)) return fail(400, 'Enter the deposit amount, or turn deposits off.');
 
+  // Online deposit (optional). Only saved when the dashboard sends it, so an
+  // older screen can never switch it off by leaving it out. Checked here,
+  // before anything is written.
+  const hasOnline = b.online_deposit_enabled !== undefined;
+  let odEnabled = false, odKind = 'percent', odPercent = 30, odFixed = 0, odPolicy = '';
+  if (hasOnline) {
+    odEnabled = b.online_deposit_enabled === true;
+    odKind = b.online_deposit_kind === 'fixed' ? 'fixed' : 'percent';
+    odPercent = cleanPercent(b.online_deposit_percent);
+    if (odPercent === null) return fail(400, 'The online deposit must be a percent from 0 to 100.');
+    odFixed = round2(Number(b.online_deposit_fixed) || 0);
+    if (odFixed < 0 || odFixed > MAX_AMOUNT) return fail(400, 'Please enter an online deposit amount that makes sense.');
+    if (odEnabled && odKind === 'percent' && !(odPercent > 0)) return fail(400, 'Enter the online deposit percent, or turn the online deposit off.');
+    if (odEnabled && odKind === 'fixed' && !(odFixed > 0)) return fail(400, 'Enter the online deposit amount, or turn the online deposit off.');
+    odPolicy = String(b.online_deposit_policy || '').replace(/\u0000/g, '').replace(/\r\n/g, '\n').trim().slice(0, 600);
+  }
+
   const saved = await sql`
     update tenant_settings set
       vat_registered = ${vatRegistered},
@@ -150,6 +197,18 @@ export async function saveMoneySettings(tenantId, input) {
     returning tenant_id
   `;
   if (saved.rows.length === 0) return fail(404, 'Save your account settings once first, then try again.');
+  if (hasOnline) {
+    await sql`
+      update tenant_settings set
+        online_deposit_enabled = ${odEnabled},
+        online_deposit_kind = ${odKind},
+        online_deposit_percent = ${odPercent}::numeric,
+        online_deposit_fixed = ${odFixed}::numeric,
+        online_deposit_policy = ${odPolicy},
+        updated_at = now()
+      where tenant_id = ${tenantId}
+    `;
+  }
   return { status: 200, json: { ok: true, settings: await getMoneySettings(tenantId) } };
 }
 

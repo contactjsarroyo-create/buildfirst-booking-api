@@ -171,6 +171,25 @@ async function loadContext(tenantId, booking) {
     ),
   ]);
 
+  // How much of an online deposit has arrived (a "Deposit" line on the bill).
+  const depositPaid =
+    Number(booking.deposit_due) > 0
+      ? await safe(
+          'deposit',
+          async () =>
+            Number(
+              (
+                await sql`
+                  select coalesce(sum(amount), 0) as paid from folio_items
+                  where booking_id = ${booking.id} and tenant_id = ${tenantId}
+                    and kind = 'payment' and voided_at is null and description like 'Deposit%'
+                `
+              ).rows[0].paid
+            ) || 0,
+          0
+        )
+      : 0;
+
   const config = settings.email_config && typeof settings.email_config === 'object' ? settings.email_config : {};
   const notify = validEmail(config.notify_email) ? config.notify_email.trim() : null;
   const ownerTo = notify || (validEmail(owner.email) ? owner.email.trim() : null);
@@ -190,6 +209,7 @@ async function loadContext(tenantId, booking) {
     roomType: unitType.name || '',
     roomLabel: room.label || '',
     addons: Array.isArray(addons) ? addons : [],
+    depositPaid,
   };
 }
 
@@ -219,6 +239,26 @@ function paymentBlock(booking, ctx, title) {
   if (ch && ch.instructions) lines.push(ch.instructions);
   if (booking.payment_reference) lines.push(`Your reference: ${booking.payment_reference}`);
   return { title: title || 'How to pay', lines, field: 'payment_title' };
+}
+
+// The online deposit the guest was asked for (an option each resort turns on).
+// Before the money arrives it says how much to send now; after, it says it was
+// received. Not shown for a booking that is fully paid.
+function depositBlock(booking, ctx) {
+  const due = Number(booking.deposit_due) || 0;
+  if (!(due > 0) || booking.payment_status === 'paid') return null;
+  const total = Number(booking.total_amount) || 0;
+  const got = Number(ctx.depositPaid) || 0;
+  const lines = [];
+  if (got > 0) {
+    lines.push(`We received your deposit of ${money(got, ctx.currency)}. Thank you.`);
+    lines.push(`Balance to pay at check-in: ${money(Math.max(total - got, 0), ctx.currency)}`);
+  } else {
+    lines.push(`Please send a deposit of ${money(due, ctx.currency)} now to keep your booking.`);
+    lines.push(`Balance to pay at check-in: ${money(Math.max(total - due, 0), ctx.currency)}`);
+  }
+  if (booking.deposit_policy) lines.push(String(booking.deposit_policy));
+  return { title: got > 0 ? 'Deposit received' : 'Deposit to pay now', lines };
 }
 
 // The fixed details table. Resorts cannot edit these rows.
@@ -292,7 +332,11 @@ function guestMessage(kind, booking, ctx) {
   const d = designOf(ctx);
 
   const blocks = [];
-  if (t.show_payment !== false) {
+  const depBlock = depositBlock(booking, ctx);
+  if (depBlock) blocks.push(depBlock);
+  // Once the deposit has arrived, the "how to pay" details are not repeated.
+  const depositIn = Number(booking.deposit_due) > 0 && Number(ctx.depositPaid) > 0 && booking.payment_status !== 'paid';
+  if (t.show_payment !== false && !depositIn) {
     const pay = paymentBlock(booking, ctx, oneLine(fillText(t.payment_title, vars)));
     if (pay) blocks.push(pay);
   }
@@ -364,6 +408,7 @@ function ownerNewBookingMessage(booking, ctx) {
     ['Guests', booking.guests],
     ['Add-ons', addonsText(ctx)],
     ['Total', money(booking.total_amount, ctx.currency)],
+    ['Deposit asked', Number(booking.deposit_due) > 0 ? money(booking.deposit_due, ctx.currency) : ''],
     ['Payment method', booking.payment_channel ? channelName(booking.payment_channel, ch) : ''],
     ['Payment reference', booking.payment_reference],
     ['Special requests', booking.special_requests],

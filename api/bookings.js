@@ -9,6 +9,7 @@ import { getFrontDesk, getFolio } from './_lib/frontdesk.js';
 import { listGuests, getGuest, addGuestInfo, attachGuestToBooking } from './_lib/guests.js';
 import { getClosing, getStatement, getExpenses } from './_lib/money.js';
 import { getAnalytics } from './_lib/analytics.js';
+import { loadOnlineDeposit, depositAmount, getPublicDeposit } from './_lib/onlinedeposit.js';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -198,6 +199,16 @@ export default async function handler(req, res) {
   if (setCors(req, res, 'GET, POST, OPTIONS')) return;
 
   if (req.method === 'GET') {
+    // Public (no login): the online deposit wording for the booking widget.
+    if (req.query && req.query.resource === 'online_deposit') {
+      try {
+        const d = await getPublicDeposit(req.query.tenant_id);
+        return res.status(d.status).json(d.json);
+      } catch (err) {
+        console.error(err);
+        return res.status(500).json({ ok: false, error: 'Server error' });
+      }
+    }
     const auth = await getAuth(req);
     if (!auth) {
       return res.status(401).json({ ok: false, error: 'Missing or invalid authorization token' });
@@ -274,6 +285,7 @@ export default async function handler(req, res) {
                      AND x.status = 'confirmed' AND x.no_show_at IS NULL)::int AS guest_earlier_stays,
                  COALESCE(fp.payments, 0)::float AS bill_payments,
                  COALESCE(fp.discounts, 0)::float AS bill_discounts,
+                 COALESCE(fp.deposits, 0)::float AS deposit_paid,
                  (COALESCE(b.total_amount, 0) + COALESCE(fp.charges, 0)
                    - CASE WHEN b.payment_status = 'paid' THEN COALESCE(b.total_amount, 0) ELSE 0 END
                    - COALESCE(fp.payments, 0) + COALESCE(fp.refunds, 0) - COALESCE(fp.discounts, 0))::float AS balance_due
@@ -283,7 +295,8 @@ export default async function handler(req, res) {
             SELECT sum(amount) FILTER (WHERE kind = 'charge') AS charges,
                    sum(amount) FILTER (WHERE kind = 'payment') AS payments,
                    sum(amount) FILTER (WHERE kind = 'refund') AS refunds,
-                   sum(amount) FILTER (WHERE kind = 'discount') AS discounts
+                   sum(amount) FILTER (WHERE kind = 'discount') AS discounts,
+                   sum(amount) FILTER (WHERE kind = 'payment' AND description LIKE 'Deposit%') AS deposits
             FROM folio_items WHERE booking_id = b.id AND voided_at IS NULL
           ) fp ON true
           WHERE b.tenant_id = ${auth.tenant_id}
@@ -413,6 +426,24 @@ export default async function handler(req, res) {
         RETURNING *
       `;
       const booking = result.rows[0];
+
+      // Online deposit (an option each resort turns on in Money, Settings).
+      // Saved on the booking so a later settings change never alters what this
+      // guest was told. Best effort: a problem here never loses the booking.
+      try {
+        const dep = await loadOnlineDeposit(b.tenant_id);
+        const due = depositAmount(dep, q.total_amount, payment_channel);
+        if (due > 0) {
+          await sql`
+            UPDATE bookings SET deposit_due = ${due}, deposit_policy = ${dep.policy || null}
+            WHERE id = ${booking.id} AND tenant_id = ${b.tenant_id}
+          `;
+          booking.deposit_due = due;
+          booking.deposit_policy = dep.policy || null;
+        }
+      } catch (depErr) {
+        console.error('online deposit not saved', depErr && depErr.message);
+      }
 
       // Link the booking to the guest's profile (creates one for a new guest).
       // Best effort: never fails the booking.
