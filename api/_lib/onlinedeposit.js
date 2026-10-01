@@ -19,14 +19,14 @@ function fail(status, error) {
   return { status, json: { ok: false, error } };
 }
 
-const OFF = { enabled: false, kind: 'percent', percent: 0, fixed: 0, policy: '' };
+const OFF = { enabled: false, kind: 'percent', percent: 0, fixed: 0, policy: '', allow_full: true };
 
 // Never throws. A missing column or table means "no online deposit".
 export async function loadOnlineDeposit(tenantId) {
   try {
     const r = await sql`
       select online_deposit_enabled, online_deposit_kind, online_deposit_percent,
-             online_deposit_fixed, online_deposit_policy
+             online_deposit_fixed, online_deposit_policy, online_deposit_allow_full
       from tenant_settings where tenant_id = ${tenantId}
     `;
     const s = r.rows[0];
@@ -37,6 +37,7 @@ export async function loadOnlineDeposit(tenantId) {
       percent: Number(s.online_deposit_percent) || 0,
       fixed: Number(s.online_deposit_fixed) || 0,
       policy: String(s.online_deposit_policy || '').trim(),
+      allow_full: s.online_deposit_allow_full !== false,
     };
   } catch (err) {
     console.error('onlineDeposit: could not load settings', err && err.message);
@@ -57,6 +58,16 @@ export function depositAmount(dep, total, channel) {
   return Math.min(amt, t);
 }
 
+// What the guest is paying now: 'deposit', 'full', or null when no online
+// deposit applies (option off, or card payment which is always in full).
+// A guest may pick 'full' only when the resort allows it.
+export function planFor(dep, channel, requested) {
+  if (!dep || dep.enabled !== true) return null;
+  if (!channel || channel === 'paymongo') return null;
+  if (requested === 'full' && dep.allow_full !== false) return 'full';
+  return 'deposit';
+}
+
 // Public read for the booking widget (no login). Only the deposit wording and
 // numbers the guest is going to see anyway.
 export async function getPublicDeposit(tenantId) {
@@ -72,6 +83,7 @@ export async function getPublicDeposit(tenantId) {
         percent: d.percent,
         fixed: d.fixed,
         policy: d.policy,
+        allow_full: d.allow_full,
       },
     },
   };
@@ -88,7 +100,7 @@ function folioMethod(channelKey, channel) {
   return 'Other';
 }
 
-export const ONLINE_DEPOSIT_ACTIONS = ['deposit_received'];
+export const ONLINE_DEPOSIT_ACTIONS = ['deposit_received', 'balance_received'];
 
 // PATCH action: the guest's deposit has arrived. Adds one bill payment line
 // "Deposit" for the amount that was asked (never more than is owed). It never
@@ -149,4 +161,47 @@ export async function onlineDepositAction(auth, body) {
   `;
   if (ins.rows.length === 0) return fail(409, 'The deposit is already on the bill.');
   return { status: 200, json: { ok: true, amount } };
+}
+
+// PATCH action: the rest of the bill has been paid (usually at check-in). Adds
+// one bill payment line for everything still owed, with the method the owner
+// picked. One statement, so a double tap cannot add it twice.
+const BALANCE_METHODS = ['Cash', 'GCash', 'Maya', 'Bank transfer', 'Card', 'Other'];
+
+export async function balanceReceivedAction(auth, body) {
+  const id = String((body && body.id) || '');
+  if (!UUID_RE.test(id)) return fail(400, 'id is required');
+  const method = BALANCE_METHODS.includes(body && body.method) ? body.method : null;
+  if (!method) return fail(400, 'Please choose how the guest paid.');
+
+  const found = await sql`
+    select id, status, payment_status from bookings
+    where id = ${id} and tenant_id = ${auth.tenant_id}
+  `;
+  const b = found.rows[0];
+  if (!b) return fail(404, 'Booking not found');
+  if (b.status === 'cancelled') return fail(409, 'This booking is cancelled.');
+  if (b.payment_status === 'paid') return fail(409, 'This booking is already marked as paid.');
+
+  // Same balance formula as the bill (see the MONEY note in the handoff).
+  const ins = await sql`
+    insert into folio_items (tenant_id, booking_id, kind, description, amount, method)
+    select t.tenant_id, t.id, 'payment', 'Payment received', t.bal, ${method}::text
+    from (
+      select b.tenant_id, b.id,
+             round((b.total_amount
+               + coalesce(sum(f.amount) filter (where f.kind = 'charge'), 0)
+               - coalesce(sum(f.amount) filter (where f.kind = 'payment'), 0)
+               + coalesce(sum(f.amount) filter (where f.kind = 'refund'), 0)
+               - coalesce(sum(f.amount) filter (where f.kind = 'discount'), 0))::numeric, 2) as bal
+      from bookings b
+      left join folio_items f on f.booking_id = b.id and f.tenant_id = b.tenant_id and f.voided_at is null
+      where b.id = ${id}::uuid and b.tenant_id = ${auth.tenant_id}::uuid
+      group by b.tenant_id, b.id, b.total_amount
+    ) t
+    where t.bal > 0.005
+    returning amount
+  `;
+  if (ins.rows.length === 0) return fail(409, 'Nothing is owed on this booking. It is already paid.');
+  return { status: 200, json: { ok: true, amount: Number(ins.rows[0].amount) } };
 }

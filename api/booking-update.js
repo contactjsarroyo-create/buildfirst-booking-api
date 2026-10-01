@@ -6,7 +6,7 @@ import { sendBookingConfirmedEmail, withTimeout } from './_lib/bookingemails.js'
 import { frontDeskAction } from './_lib/frontdesk.js';
 import { guestAction, GUEST_ACTIONS } from './_lib/guests.js';
 import { moneyAction, MONEY_ACTIONS } from './_lib/money.js';
-import { onlineDepositAction, ONLINE_DEPOSIT_ACTIONS } from './_lib/onlinedeposit.js';
+import { onlineDepositAction, balanceReceivedAction, ONLINE_DEPOSIT_ACTIONS } from './_lib/onlinedeposit.js';
 
 export default async function handler(req, res) {
   if (setCors(req, res, 'PATCH, OPTIONS')) return;
@@ -38,6 +38,10 @@ export default async function handler(req, res) {
   // the guest their confirmation email (once, like Mark as paid does).
   if (req.body && ONLINE_DEPOSIT_ACTIONS.includes(req.body.action)) {
     try {
+      if (req.body.action === 'balance_received') {
+        const rb = await balanceReceivedAction(auth, req.body);
+        return res.status(rb.status).json(rb.json);
+      }
       const r = await onlineDepositAction(auth, req.body);
       if (r.status === 200) {
         r.json.guest_emailed =

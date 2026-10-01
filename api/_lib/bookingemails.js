@@ -409,6 +409,7 @@ function ownerNewBookingMessage(booking, ctx) {
     ['Add-ons', addonsText(ctx)],
     ['Total', money(booking.total_amount, ctx.currency)],
     ['Deposit asked', Number(booking.deposit_due) > 0 ? money(booking.deposit_due, ctx.currency) : ''],
+    ['Guest chose to pay', booking.pay_plan === 'full' ? 'The full amount now' : ''],
     ['Payment method', booking.payment_channel ? channelName(booking.payment_channel, ch) : ''],
     ['Payment reference', booking.payment_reference],
     ['Special requests', booking.special_requests],

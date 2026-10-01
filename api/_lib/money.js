@@ -82,7 +82,7 @@ function todayIn(timezone) {
 // ------------------------------------------------------------
 const ONLINE_OFF = {
   online_deposit_enabled: false, online_deposit_kind: 'percent', online_deposit_percent: 30,
-  online_deposit_fixed: 0, online_deposit_policy: '',
+  online_deposit_fixed: 0, online_deposit_policy: '', online_deposit_allow_full: true,
 };
 
 // The online deposit option is read on its own, so a resort whose database has
@@ -91,7 +91,7 @@ async function getOnlineDepositSettings(tenantId) {
   try {
     const r = await sql`
       select online_deposit_enabled, online_deposit_kind, online_deposit_percent,
-             online_deposit_fixed, online_deposit_policy
+             online_deposit_fixed, online_deposit_policy, online_deposit_allow_full
       from tenant_settings where tenant_id = ${tenantId}
     `;
     const s = r.rows[0];
@@ -102,6 +102,7 @@ async function getOnlineDepositSettings(tenantId) {
       online_deposit_percent: s.online_deposit_percent === null ? 30 : Number(s.online_deposit_percent),
       online_deposit_fixed: s.online_deposit_fixed === null ? 0 : Number(s.online_deposit_fixed),
       online_deposit_policy: String(s.online_deposit_policy || ''),
+      online_deposit_allow_full: s.online_deposit_allow_full !== false,
     };
   } catch (err) {
     return { ...ONLINE_OFF };
@@ -169,9 +170,10 @@ export async function saveMoneySettings(tenantId, input) {
   // older screen can never switch it off by leaving it out. Checked here,
   // before anything is written.
   const hasOnline = b.online_deposit_enabled !== undefined;
-  let odEnabled = false, odKind = 'percent', odPercent = 30, odFixed = 0, odPolicy = '';
+  let odEnabled = false, odKind = 'percent', odPercent = 30, odFixed = 0, odPolicy = '', odAllowFull = true;
   if (hasOnline) {
     odEnabled = b.online_deposit_enabled === true;
+    odAllowFull = b.online_deposit_allow_full !== false;
     odKind = b.online_deposit_kind === 'fixed' ? 'fixed' : 'percent';
     odPercent = cleanPercent(b.online_deposit_percent);
     if (odPercent === null) return fail(400, 'The online deposit must be a percent from 0 to 100.');
@@ -205,6 +207,7 @@ export async function saveMoneySettings(tenantId, input) {
         online_deposit_percent = ${odPercent}::numeric,
         online_deposit_fixed = ${odFixed}::numeric,
         online_deposit_policy = ${odPolicy},
+        online_deposit_allow_full = ${odAllowFull},
         updated_at = now()
       where tenant_id = ${tenantId}
     `;

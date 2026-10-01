@@ -9,7 +9,7 @@ import { getFrontDesk, getFolio } from './_lib/frontdesk.js';
 import { listGuests, getGuest, addGuestInfo, attachGuestToBooking } from './_lib/guests.js';
 import { getClosing, getStatement, getExpenses } from './_lib/money.js';
 import { getAnalytics } from './_lib/analytics.js';
-import { loadOnlineDeposit, depositAmount, getPublicDeposit } from './_lib/onlinedeposit.js';
+import { loadOnlineDeposit, depositAmount, planFor, getPublicDeposit } from './_lib/onlinedeposit.js';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -432,14 +432,18 @@ export default async function handler(req, res) {
       // guest was told. Best effort: a problem here never loses the booking.
       try {
         const dep = await loadOnlineDeposit(b.tenant_id);
-        const due = depositAmount(dep, q.total_amount, payment_channel);
-        if (due > 0) {
+        const plan = planFor(dep, payment_channel, b.pay_plan);
+        const due = plan === 'deposit' ? depositAmount(dep, q.total_amount, payment_channel) : 0;
+        const savedPlan = plan === 'deposit' && !(due > 0) ? null : plan;
+        if (savedPlan) {
           await sql`
-            UPDATE bookings SET deposit_due = ${due}, deposit_policy = ${dep.policy || null}
+            UPDATE bookings SET deposit_due = ${due}, deposit_policy = ${due > 0 ? dep.policy || null : null},
+                                pay_plan = ${savedPlan}
             WHERE id = ${booking.id} AND tenant_id = ${b.tenant_id}
           `;
           booking.deposit_due = due;
-          booking.deposit_policy = dep.policy || null;
+          booking.deposit_policy = due > 0 ? dep.policy || null : null;
+          booking.pay_plan = savedPlan;
         }
       } catch (depErr) {
         console.error('online deposit not saved', depErr && depErr.message);
