@@ -29,6 +29,7 @@ import {
 import { sanitizeEmailConfig, EMAIL_DEFAULTS, PLACEHOLDERS } from './_lib/emailcore.js';
 import { sendTestEmail } from './_lib/bookingemails.js';
 import { getMoneySettings, saveMoneySettings } from './_lib/money.js';
+import { getIcalState, icalAction, icalCron } from './_lib/ical.js';
 
 const HEX_RE = /^#[0-9a-fA-F]{6}$/;
 const FONT_WHITELIST = [
@@ -435,6 +436,29 @@ async function handleEmails(req, res, auth) {
 //   PUT   { vat_registered, vat_percent, service_charge_enabled, service_charge_percent,
 //           deposit_enabled, deposit_kind, deposit_percent, deposit_fixed }
 // ------------------------------------------------------------
+// ------------------------------------------------------------
+// Calendar sync (iCal), owner only. GET returns every room with its private
+// link and the links it reads from other sites. POST takes an `action`:
+// export_on, export_off, export_new, import_add, import_remove, sync,
+// sync_all, sync_stale. All the work is in _lib/ical.js.
+// ------------------------------------------------------------
+async function handleIcal(req, res, auth) {
+  if (staffBlocked(auth, res)) return;
+  if (req.method === 'GET') {
+    try {
+      return res.status(200).json({ ok: true, ...(await getIcalState(auth.tenant_id)) });
+    } catch (err) {
+      console.error('ical state', err && err.message);
+      return res.status(500).json({ ok: false, error: 'Calendar sync is not ready yet.' });
+    }
+  }
+  if (req.method === 'POST') {
+    const r = await icalAction(auth, req.body);
+    return res.status(r.status).json(r.json);
+  }
+  return res.status(405).json({ ok: false, error: 'Method not allowed' });
+}
+
 async function handleMoney(req, res, auth) {
   if (staffBlocked(auth, res)) return;
   if (req.method === 'GET') {
@@ -640,6 +664,16 @@ async function handleStaff(req, res, auth) {
 export default async function handler(req, res) {
   if (setCors(req, res, 'GET, PUT, POST, DELETE, OPTIONS')) return;
 
+  // Daily calendar refresh (Vercel cron). No login: it checks CRON_SECRET itself.
+  if (req.query && req.query.resource === 'ical_cron') {
+    try {
+      return await icalCron(req, res);
+    } catch (err) {
+      console.error('ical cron', err && err.message);
+      return res.status(500).json({ ok: false, error: 'Server error' });
+    }
+  }
+
   const auth = await getAuth(req);
   if (!auth) return res.status(401).json({ ok: false, error: 'Unauthorized' });
 
@@ -655,6 +689,9 @@ export default async function handler(req, res) {
     }
     if (req.query && req.query.resource === 'money') {
       return await handleMoney(req, res, auth);
+    }
+    if (req.query && req.query.resource === 'ical') {
+      return await handleIcal(req, res, auth);
     }
 
     if (req.method === 'GET') {

@@ -125,7 +125,18 @@ export default async function handler(req, res) {
         where id = ${id} and tenant_id = ${auth.tenant_id} and source = 'manual'
         returning id
       `;
-      if (result.rows.length === 0) return res.status(404).json({ ok: false, error: 'Not found' });
+      if (result.rows.length === 0) {
+        const other = await sql`
+          select source from availability_blocks where id = ${id} and tenant_id = ${auth.tenant_id}
+        `;
+        if (other.rows.length > 0 && other.rows[0].source === 'ical') {
+          return res.status(409).json({
+            ok: false,
+            error: 'These dates come from a synced calendar link. Remove or change the link in Property Settings, Calendar sync.',
+          });
+        }
+        return res.status(404).json({ ok: false, error: 'Not found' });
+      }
       return res.status(200).json({ ok: true });
     }
 

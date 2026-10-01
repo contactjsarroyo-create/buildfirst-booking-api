@@ -2,6 +2,7 @@ import { sql } from '@vercel/postgres';
 import { setCors, text, isBookableStatus } from './_lib/helpers.js';
 import { getAccount, countBookingsThisMonth } from './_lib/limits.js';
 import { loadRulesByType, priceOverrides, minStayOverrides } from './_lib/rates.js';
+import { serveFeed } from './_lib/ical.js';
 
 // Only PayMongo is built in. Any other channel is created by the tenant and stored
 // under a "custom_..." key (see settings.js), so there is nothing else to default.
@@ -110,6 +111,17 @@ export default async function handler(req, res) {
   if (setCors(req, res, 'GET, OPTIONS')) return;
   if (req.method !== 'GET') {
     return res.status(405).json({ ok: false, error: 'Method not allowed' });
+  }
+
+  // Calendar link for other sites (Booking.com, Agoda, ...): no login, the long
+  // random token is the protection. Shares this route so no new function is added.
+  if (req.query && req.query.feed) {
+    try {
+      return await serveFeed(req, res);
+    } catch (err) {
+      console.error('ical feed', err && err.message);
+      return res.status(500).send('Server error');
+    }
   }
 
   try {

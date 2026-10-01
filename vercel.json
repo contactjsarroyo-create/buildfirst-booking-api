@@ -1,0 +1,9 @@
+{
+  "functions": {
+    "api/settings.js": { "maxDuration": 60 }
+  },
+  "crons": [
+    { "path": "/api/health?resource=cleanup", "schedule": "0 20 * * *" },
+    { "path": "/api/settings?resource=ical_cron", "schedule": "0 22 * * *" }
+  ]
+}
