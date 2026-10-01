@@ -1,3 +1,4 @@
+import { withAlerts } from '../_lib/alerts.js';
 import { sql } from '@vercel/postgres';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
@@ -290,7 +291,7 @@ async function handleChangePassword(req, body, res) {
   return res.status(200).json({ ok: true });
 }
 
-export default async function handler(req, res) {
+async function handler(req, res) {
   if (setCors(req, res, 'POST, OPTIONS')) return;
 
   if (req.method !== 'POST') {
@@ -326,3 +327,5 @@ export default async function handler(req, res) {
     return res.status(500).json({ ok: false, error: 'Server error' });
   }
 }
+
+export default withAlerts('login', handler);

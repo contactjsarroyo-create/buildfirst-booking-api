@@ -1,3 +1,4 @@
+import { withAlerts } from './_lib/alerts.js';
 import { sql } from '@vercel/postgres';
 import { put } from '@vercel/blob';
 import { setCors, getAuth, staffCannot } from './_lib/helpers.js';
@@ -197,7 +198,7 @@ function validateCustomFieldResponses(customFields, responses) {
   return { values: out, error: null };
 }
 
-export default async function handler(req, res) {
+async function handler(req, res) {
   if (setCors(req, res, 'GET, POST, OPTIONS')) return;
 
   if (req.method === 'GET') {
@@ -541,3 +542,5 @@ export default async function handler(req, res) {
 
   return res.status(405).json({ ok: false, error: 'Method not allowed' });
 }
+
+export default withAlerts('bookings', handler);

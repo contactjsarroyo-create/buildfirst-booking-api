@@ -1,3 +1,4 @@
+import { withAlerts } from './_lib/alerts.js';
 import { sql } from '@vercel/postgres';
 import { put } from '@vercel/blob';
 import { setCors, getAuth, can, staffCannot, num, text } from './_lib/helpers.js';
@@ -42,7 +43,7 @@ async function createRoomsForType(tenantId, unitTypeId, name, count) {
   }
 }
 
-export default async function handler(req, res) {
+async function handler(req, res) {
   if (setCors(req, res, 'GET, POST, PUT, DELETE, OPTIONS')) return;
 
   const auth = await getAuth(req);
@@ -680,3 +681,5 @@ async function handleRules(req, res, auth) {
   if (r.rows.length === 0) return res.status(404).json({ ok: false, error: 'Not found' });
   return res.status(200).json({ ok: true });
 }
+
+export default withAlerts('unit-types', handler);

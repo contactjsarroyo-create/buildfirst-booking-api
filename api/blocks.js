@@ -1,3 +1,4 @@
+import { withAlerts } from './_lib/alerts.js';
 import { sql } from '@vercel/postgres';
 import { setCors, getAuth, staffCannot, text } from './_lib/helpers.js';
 import { getHousekeeping, housekeepingAction } from './_lib/housekeeping.js';
@@ -5,7 +6,7 @@ import { getHousekeeping, housekeepingAction } from './_lib/housekeeping.js';
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-export default async function handler(req, res) {
+async function handler(req, res) {
   if (setCors(req, res, 'GET, POST, DELETE, OPTIONS')) return;
 
   const auth = await getAuth(req);
@@ -146,3 +147,5 @@ export default async function handler(req, res) {
     return res.status(500).json({ ok: false, error: 'Server error' });
   }
 }
+
+export default withAlerts('blocks', handler);

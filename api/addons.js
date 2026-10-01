@@ -1,7 +1,8 @@
+import { withAlerts } from './_lib/alerts.js';
 import { sql } from '@vercel/postgres';
 import { setCors, getAuth, staffCannot, num, text } from './_lib/helpers.js';
 
-export default async function handler(req, res) {
+async function handler(req, res) {
   if (setCors(req, res, 'GET, POST, PUT, OPTIONS')) return;
 
   const auth = await getAuth(req);
@@ -57,3 +58,5 @@ export default async function handler(req, res) {
     return res.status(500).json({ ok: false, error: 'Server error' });
   }
 }
+
+export default withAlerts('addons', handler);

@@ -1,3 +1,4 @@
+import { withAlerts } from './_lib/alerts.js';
 import { sql } from '@vercel/postgres';
 import { setCors, getAuth, staffCannot } from './_lib/helpers.js';
 
@@ -8,7 +9,7 @@ import { guestAction, GUEST_ACTIONS } from './_lib/guests.js';
 import { moneyAction, MONEY_ACTIONS } from './_lib/money.js';
 import { onlineDepositAction, balanceReceivedAction, ONLINE_DEPOSIT_ACTIONS } from './_lib/onlinedeposit.js';
 
-export default async function handler(req, res) {
+async function handler(req, res) {
   if (setCors(req, res, 'PATCH, OPTIONS')) return;
   if (req.method !== 'PATCH') {
     return res.status(405).json({ ok: false, error: 'Method not allowed' });
@@ -271,3 +272,5 @@ export default async function handler(req, res) {
     return res.status(500).json({ ok: false, error: 'Server error' });
   }
 }
+
+export default withAlerts('booking-update', handler);

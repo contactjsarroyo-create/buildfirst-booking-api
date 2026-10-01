@@ -1,3 +1,4 @@
+import { withAlerts } from '../_lib/alerts.js';
 import { sql } from '@vercel/postgres';
 import bcrypt from 'bcryptjs';
 import { setCors, text } from '../_lib/helpers.js';
@@ -29,7 +30,7 @@ async function findAvailableSlug(base) {
   return null;
 }
 
-export default async function handler(req, res) {
+async function handler(req, res) {
   if (setCors(req, res, 'POST, OPTIONS')) return;
   if (req.method !== 'POST') {
     return res.status(405).json({ ok: false, error: 'Method not allowed' });
@@ -103,3 +104,5 @@ export default async function handler(req, res) {
     return res.status(500).json({ ok: false, error: 'Server error' });
   }
 }
+
+export default withAlerts('signup', handler);

@@ -1,3 +1,4 @@
+import { withAlerts } from './_lib/alerts.js';
 import { sql } from '@vercel/postgres';
 import { put } from '@vercel/blob';
 import { setCors, getAuth, staffBlocked, staffCannot, normalizePermissions, PERMISSION_AREAS, num, text } from './_lib/helpers.js';
@@ -689,7 +690,7 @@ async function handleStaff(req, res, auth) {
   return res.status(405).json({ ok: false, error: 'Method not allowed' });
 }
 
-export default async function handler(req, res) {
+async function handler(req, res) {
   if (setCors(req, res, 'GET, PUT, POST, DELETE, OPTIONS')) return;
 
   // Daily calendar refresh (Vercel cron). No login: it checks CRON_SECRET itself.
@@ -996,3 +997,5 @@ export default async function handler(req, res) {
     return res.status(500).json({ ok: false, error: 'Server error' });
   }
 }
+
+export default withAlerts('settings', handler);

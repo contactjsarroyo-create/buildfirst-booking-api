@@ -1,3 +1,4 @@
+import { withAlerts } from './_lib/alerts.js';
 import { sql } from '@vercel/postgres';
 import { setCors, text, isBookableStatus } from './_lib/helpers.js';
 import { getAccount, countBookingsThisMonth } from './_lib/limits.js';
@@ -107,7 +108,7 @@ async function computeUnavailable(tenantId, unitTypes, today, windowDays) {
   return result;
 }
 
-export default async function handler(req, res) {
+async function handler(req, res) {
   if (setCors(req, res, 'GET, OPTIONS')) return;
   if (req.method !== 'GET') {
     return res.status(405).json({ ok: false, error: 'Method not allowed' });
@@ -273,3 +274,5 @@ export default async function handler(req, res) {
     return res.status(500).json({ ok: false, error: 'Server error' });
   }
 }
+
+export default withAlerts('public-config', handler);

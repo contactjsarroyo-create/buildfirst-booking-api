@@ -1,7 +1,8 @@
+import { withAlerts } from './_lib/alerts.js';
 import { sql } from '@vercel/postgres';
 import { expireFiles } from './_lib/storage.js';
 
-export default async function handler(req, res) {
+async function handler(req, res) {
   // Daily storage cleanup, triggered by the cron in vercel.json. Merged into
   // this file (not a new route) because of the 12-function Hobby cap.
   // Vercel sends "Authorization: Bearer <CRON_SECRET>" on cron calls, so
@@ -27,3 +28,5 @@ export default async function handler(req, res) {
     res.status(500).json({ ok: false, error: err.message });
   }
 }
+
+export default withAlerts('health', handler);
