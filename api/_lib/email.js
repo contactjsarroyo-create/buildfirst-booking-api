@@ -140,7 +140,7 @@ function esc(v) {
 // Sent when an owner adds a staff login. The link opens the same page as
 // "reset password", where the person chooses their own password.
 export function staffInviteEmail(link, resortName) {
-  const name = String(resortName || 'a resort').slice(0, 100);
+  const name = String(resortName || 'a property').slice(0, 100);
   return {
     subject: `You have been invited to ${name} on Buildfirst`,
     html: layout(

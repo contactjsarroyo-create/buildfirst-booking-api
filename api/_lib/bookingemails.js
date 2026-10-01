@@ -195,7 +195,7 @@ async function loadContext(tenantId, booking) {
   const ownerTo = notify || (validEmail(owner.email) ? owner.email.trim() : null);
 
   return {
-    resort: oneLine(tenant.name) || 'the resort',
+    resort: oneLine(tenant.name) || 'the property',
     currency: tenant.currency || 'PHP',
     color: settings.primary_color,
     logoUrl: settings.logo_url || '',

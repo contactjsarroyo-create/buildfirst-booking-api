@@ -17,7 +17,7 @@ export const EMAIL_KINDS = ['guest_received', 'guest_confirmed', 'owner_new'];
 export const PLACEHOLDERS = [
   { key: 'guest_name', label: 'Guest name' },
   { key: 'first_name', label: 'Guest first name' },
-  { key: 'resort_name', label: 'Resort name' },
+  { key: 'resort_name', label: 'Property name' },
   { key: 'reference', label: 'Booking reference' },
   { key: 'room', label: 'Room' },
   { key: 'check_in', label: 'Check-in date' },

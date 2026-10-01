@@ -1,7 +1,7 @@
 import { sql } from '@vercel/postgres';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import { setCors } from '../_lib/helpers.js';
+import { setCors, getAuth } from '../_lib/helpers.js';
 import { resolveAccount, publicAccount } from '../_lib/limits.js';
 import { issueToken, findToken, consumeToken } from '../_lib/authtokens.js';
 import { appLink, sendEmail, verificationEmail, resetEmail } from '../_lib/email.js';
@@ -13,6 +13,10 @@ import { appLink, sendEmail, verificationEmail, resetEmail } from '../_lib/email
 //   "resend"           send a new verification email
 //   "forgot"           send a password reset email
 //   "reset"            set a new password from the link token
+// Signed-in actions (need the login token), used by Account Settings:
+//   "profile"          the person's email, role and display name
+//   "update_profile"   save the display name
+//   "change_password"  change the password (needs the current one)
 
 const MIN_PASSWORD_LENGTH = 8;
 
@@ -197,6 +201,95 @@ async function handleReset(body, res) {
   return res.status(200).json({ ok: true });
 }
 
+// ------------------------------------------------------------
+// Signed-in account actions. They answer 401 only when the login token is
+// bad (the dashboard then sends the person to sign in). A wrong current
+// password is a 400, so it never logs them out.
+// ------------------------------------------------------------
+async function handleProfile(req, res) {
+  const auth = await getAuth(req);
+  if (!auth) return res.status(401).json({ ok: false, error: 'Please sign in again' });
+
+  let row;
+  try {
+    const r = await sql`
+      select email, role, display_name from tenant_users
+      where id::text = ${String(auth.user_id)} limit 1
+    `;
+    row = r.rows[0];
+  } catch (colErr) {
+    // display_name column not added yet: still show email and role.
+    const r = await sql`
+      select email, role from tenant_users
+      where id::text = ${String(auth.user_id)} limit 1
+    `;
+    row = r.rows[0];
+  }
+  if (!row) return res.status(401).json({ ok: false, error: 'Please sign in again' });
+
+  return res.status(200).json({
+    ok: true,
+    email: row.email,
+    role: row.role,
+    display_name: row.display_name || '',
+  });
+}
+
+async function handleUpdateProfile(req, body, res) {
+  const auth = await getAuth(req);
+  if (!auth) return res.status(401).json({ ok: false, error: 'Please sign in again' });
+
+  const name = typeof body.display_name === 'string'
+    ? body.display_name.replace(/[\u0000-\u001f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60)
+    : '';
+
+  try {
+    await sql`
+      update tenant_users set display_name = ${name || null}
+      where id::text = ${String(auth.user_id)}
+    `;
+  } catch (colErr) {
+    console.error('update_profile failed (display_name column missing?)', colErr && colErr.message);
+    return res.status(500).json({ ok: false, error: 'Could not save your name yet. The account update has not been installed.' });
+  }
+  return res.status(200).json({ ok: true, display_name: name });
+}
+
+async function handleChangePassword(req, body, res) {
+  const auth = await getAuth(req);
+  if (!auth) return res.status(401).json({ ok: false, error: 'Please sign in again' });
+
+  const current = typeof body.current_password === 'string' ? body.current_password : '';
+  const next = typeof body.new_password === 'string' ? body.new_password : '';
+
+  if (!current) return res.status(400).json({ ok: false, error: 'Enter your current password' });
+  if (next.length < MIN_PASSWORD_LENGTH) {
+    return res.status(400).json({ ok: false, error: `Your new password must be at least ${MIN_PASSWORD_LENGTH} characters` });
+  }
+
+  const r = await sql`
+    select password_hash from tenant_users
+    where id::text = ${String(auth.user_id)} limit 1
+  `;
+  if (r.rows.length === 0) return res.status(401).json({ ok: false, error: 'Please sign in again' });
+
+  const matches = await bcrypt.compare(current, r.rows[0].password_hash);
+  if (!matches) return res.status(400).json({ ok: false, error: 'Your current password is not right.' });
+  if (current === next) {
+    return res.status(400).json({ ok: false, error: 'Choose a password that is different from your current one.' });
+  }
+
+  const passwordHash = await bcrypt.hash(next, 10);
+  await sql`
+    update tenant_users set password_hash = ${passwordHash}
+    where id::text = ${String(auth.user_id)}
+  `;
+  // Any reset link sent earlier should not work any more.
+  await sql`delete from auth_tokens where user_id = ${String(auth.user_id)} and purpose = 'reset'`;
+
+  return res.status(200).json({ ok: true });
+}
+
 export default async function handler(req, res) {
   if (setCors(req, res, 'POST, OPTIONS')) return;
 
@@ -219,6 +312,12 @@ export default async function handler(req, res) {
         return await handleForgot(body, res);
       case 'reset':
         return await handleReset(body, res);
+      case 'profile':
+        return await handleProfile(req, res);
+      case 'update_profile':
+        return await handleUpdateProfile(req, body, res);
+      case 'change_password':
+        return await handleChangePassword(req, body, res);
       default:
         return res.status(400).json({ ok: false, error: 'Unknown action' });
     }
