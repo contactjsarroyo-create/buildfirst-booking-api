@@ -2,6 +2,7 @@ import { sql } from '@vercel/postgres';
 import { put } from '@vercel/blob';
 import { setCors, getAuth, staffBlocked, staffCannot, normalizePermissions, PERMISSION_AREAS, num, text } from './_lib/helpers.js';
 import crypto from 'crypto';
+import { getPaymongoSettings, savePaymongoSettings, removePaymongo } from './_lib/paymongo.js';
 import { issueToken } from './_lib/authtokens.js';
 import { sendEmail, appLink, staffInviteEmail } from './_lib/email.js';
 import {
@@ -459,6 +460,33 @@ async function handleIcal(req, res, auth) {
   return res.status(405).json({ ok: false, error: 'Method not allowed' });
 }
 
+// The property's own PayMongo account (owner only). GET shows whether it is
+// connected (never the key), PUT saves the secret key and/or the ways guests
+// can pay, DELETE disconnects. The key is stored encrypted (_lib/paymongo.js).
+async function handlePaymongo(req, res, auth) {
+  if (staffBlocked(auth, res)) return;
+  const host = req.headers['x-forwarded-host'] || req.headers.host || '';
+  const origin = 'https://' + String(host).split(',')[0].trim();
+  try {
+    if (req.method === 'GET') {
+      const r = await getPaymongoSettings(auth.tenant_id, origin);
+      return res.status(r.status).json(r.json);
+    }
+    if (req.method === 'PUT') {
+      const r = await savePaymongoSettings(auth.tenant_id, req.body, origin);
+      return res.status(r.status).json(r.json);
+    }
+    if (req.method === 'DELETE') {
+      const r = await removePaymongo(auth.tenant_id);
+      return res.status(r.status).json(r.json);
+    }
+  } catch (err) {
+    console.error('paymongo settings', err && err.message);
+    return res.status(500).json({ ok: false, error: 'Online payment settings could not be saved. Please try again.' });
+  }
+  return res.status(405).json({ ok: false, error: 'Method not allowed' });
+}
+
 async function handleMoney(req, res, auth) {
   if (staffBlocked(auth, res)) return;
   if (req.method === 'GET') {
@@ -689,6 +717,9 @@ export default async function handler(req, res) {
     }
     if (req.query && req.query.resource === 'money') {
       return await handleMoney(req, res, auth);
+    }
+    if (req.query && req.query.resource === 'paymongo') {
+      return await handlePaymongo(req, res, auth);
     }
     if (req.query && req.query.resource === 'ical') {
       return await handleIcal(req, res, auth);

@@ -10,6 +10,8 @@ import { listGuests, getGuest, addGuestInfo, attachGuestToBooking } from './_lib
 import { getClosing, getStatement, getExpenses } from './_lib/money.js';
 import { getAnalytics } from './_lib/analytics.js';
 import { loadOnlineDeposit, depositAmount, planFor, getPublicDeposit } from './_lib/onlinedeposit.js';
+import { decryptText } from './_lib/crypto.js';
+import { hasPaymongo, createCheckout, handlePaymongoWebhook } from './_lib/paymongo.js';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -309,6 +311,8 @@ export default async function handler(req, res) {
         `;
         rows = plain.rows;
       }
+      // ID numbers are stored encrypted; the signed-in team sees them as plain text.
+      rows = rows.map((r) => (r.guest_id_number ? { ...r, guest_id_number: decryptText(r.guest_id_number) } : r));
       return res.status(200).json({ ok: true, bookings: rows });
     } catch (err) {
       console.error(err);
@@ -320,6 +324,18 @@ export default async function handler(req, res) {
     // POST stays open with no login required - this is the public guest-facing
     // booking widget, not the dashboard. tenant_id comes from the widget's config.
     const b = req.body || {};
+
+    // PayMongo tells us a guest's card/e-wallet checkout was paid. No login: the
+    // link carries the property's own secret token (see _lib/paymongo.js).
+    if (req.query && req.query.resource === 'paymongo_webhook') {
+      try {
+        const w = await handlePaymongoWebhook(req);
+        return res.status(w.status).json(w.json);
+      } catch (err) {
+        console.error('paymongo webhook', err && err.message);
+        return res.status(500).json({ ok: false, error: 'Server error' });
+      }
+    }
 
     // A single sibling action multiplexed onto POST rather than a new route
     // file — the project is at Vercel Hobby's 12-function cap. Must be
@@ -355,6 +371,12 @@ export default async function handler(req, res) {
     }
     if (!payment_channel || !isValidPaymentChannelKey(payment_channel)) {
       return res.status(400).json({ ok: false, error: 'Please choose a valid payment method' });
+    }
+    // Card / e-wallet payment sends the guest to the property's PayMongo page and
+    // back, so it needs the page address to come back to.
+    const return_url = b.return_url ? String(b.return_url).trim().slice(0, 500) : '';
+    if (payment_channel === 'paymongo' && !/^https?:\/\/[^\s]{3,}$/.test(return_url)) {
+      return res.status(400).json({ ok: false, error: 'return_url is required for online payment' });
     }
 
     try {
@@ -394,6 +416,12 @@ export default async function handler(req, res) {
       if (payment_channel !== 'paymongo' && formConfig.reference_mode === 'required' && !payment_reference) {
         const referenceLabel = formConfig.reference_label || 'Payment reference';
         return res.status(400).json({ ok: false, error: `"${referenceLabel}" is required` });
+      }
+
+      // Online payment only works when the property has saved its PayMongo key.
+      // Otherwise the guest would be told to pay with nowhere to pay.
+      if (payment_channel === 'paymongo' && !(await hasPaymongo(b.tenant_id))) {
+        return res.status(400).json({ ok: false, error: 'Online payment is not set up for this property yet. Please choose another way to pay or contact the property.' });
       }
 
       const customFields = settingsResult.rows[0] ? settingsResult.rows[0].custom_fields : [];
@@ -490,9 +518,21 @@ export default async function handler(req, res) {
       // before we answer, because Vercel can stop the function once the response
       // is sent. Never throws, and waits at most a few seconds, so a mail problem
       // can't fail or delay the booking beyond that.
-      await withTimeout(sendBookingCreatedEmails(b.tenant_id, booking, account));
+      // The PayMongo checkout is made at the same time (it waits at most 5 seconds)
+      // so the guest can be sent to pay right after booking.
+      const [, checkout] = await Promise.all([
+        withTimeout(sendBookingCreatedEmails(b.tenant_id, booking, account)),
+        payment_channel === 'paymongo'
+          ? createCheckout({ tenantId: b.tenant_id, booking, returnUrl: return_url })
+          : Promise.resolve(null),
+      ]);
 
-      return res.status(201).json({ ok: true, booking });
+      return res.status(201).json({
+        ok: true,
+        booking,
+        checkout_url: checkout && checkout.url ? checkout.url : null,
+        checkout_error: checkout && checkout.error ? checkout.error : null,
+      });
     } catch (err) {
       console.error(err);
       return res.status(500).json({ ok: false, error: 'Server error' });

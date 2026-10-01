@@ -1,4 +1,5 @@
 import { sql } from '@vercel/postgres';
+import { decryptText } from './crypto.js';
 
 // Money: the daily closing report and the statement of account.
 // Lives in _lib so it adds no serverless function (Vercel Hobby cap is 12).
@@ -555,7 +556,7 @@ export async function getStatement(tenantId, bookingId) {
     description: x.description,
     person_type: x.person_type || null,
     person_name: x.person_name || '',
-    person_id: x.person_id || '',
+    person_id: decryptText(x.person_id) || '',
     scope: x.discount_scope || null,
     basis: round2(x.basis),
     discount_part: round2(x.discount_part),
@@ -594,7 +595,7 @@ export async function getStatement(tenantId, bookingId) {
         reference: String(b.id).slice(0, 8).toUpperCase(),
         guest: {
           name: b.guest_name, email: b.guest_email || null, phone: b.guest_phone || null,
-          id_type: b.guest_id_type || null, id_number: b.guest_id_number || null,
+          id_type: b.guest_id_type || null, id_number: decryptText(b.guest_id_number) || null,
         },
         stay: {
           room: b.room || null, room_type: b.room_type || null, check_in: b.check_in, check_out: b.check_out,

@@ -4,6 +4,7 @@ import { getAccount, countBookingsThisMonth } from './limits.js';
 import { addGuestInfo, attachGuestToBooking } from './guests.js';
 import { PERSON_TYPES, roomDiscount, itemsDiscount, vatRateOf } from './discounts.js';
 import { getMoneySettings } from './money.js';
+import { encryptSoft, decryptText } from './crypto.js';
 
 // Front Desk: arrivals, in-house guests, check-in / check-out, folio (extra
 // charges and payments), room status, staff-entered walk-in bookings.
@@ -16,6 +17,11 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_AMOUNT = 10000000;
+
+// ID numbers are stored encrypted. Open them before they leave the server.
+function openIds(r) {
+  return r && r.guest_id_number ? { ...r, guest_id_number: decryptText(r.guest_id_number) } : r;
+}
 
 function todayIn(timezone) {
   try {
@@ -110,7 +116,7 @@ export async function getFrontDesk(tenantId) {
   `;
   const rows = await addGuestInfo(
     tenantId,
-    result.rows.map((r) => ({ ...r, balance_due: balanceOf(r) }))
+    result.rows.map((r) => openIds({ ...r, balance_due: balanceOf(r) }))
   );
   const inHouse = rows.filter((r) => r.checked_in_at);
   const arrivals = rows.filter((r) => !r.checked_in_at);
@@ -146,7 +152,7 @@ export async function getFrontDesk(tenantId) {
   `;
   const checkedOut = await addGuestInfo(
     tenantId,
-    outResult.rows.map((r) => ({ ...r, balance_due: balanceOf(r) }))
+    outResult.rows.map((r) => openIds({ ...r, balance_due: balanceOf(r) }))
   );
 
   const roomsResult = await sql`
@@ -233,7 +239,7 @@ export async function getFolio(tenantId, bookingId) {
       booking_id: b.id,
       total_amount: total,
       paid_on_booking: b.payment_status === 'paid',
-      items: items.rows,
+      items: items.rows.map((r) => (r.person_id ? { ...r, person_id: decryptText(r.person_id) } : r)),
       balance_due: balance,
       money: {
         service_charge: {
@@ -335,7 +341,7 @@ async function doCheckIn(tenantId, bookingId, roomIdIn, idTypeIn, idNumberIn) {
   await sql`
     update bookings set
       checked_in_at = now(), room_id = ${roomId}, unit_type_id = ${problem.unit_type_id},
-      guest_id_type = ${idType || null}, guest_id_number = ${idNumber || null}
+      guest_id_type = ${idType || null}, guest_id_number = ${encryptSoft(idNumber) || null}
     where id = ${bookingId} and tenant_id = ${tenantId}
   `;
   return done({});
@@ -593,7 +599,7 @@ async function addDiscount(tenantId, id, body) {
     from folio_items
     where booking_id = ${id} and tenant_id = ${tenantId} and kind = 'discount' and voided_at is null
   `;
-  const existing = ex.rows;
+  const existing = ex.rows.map((r) => ({ ...r, person_id: decryptText(r.person_id) }));
   const sameName = (r) => String(r.person_name || '').trim().toLowerCase() === personName.toLowerCase();
   const sameId = (r) => String(r.person_id || '').trim().toLowerCase() === personId.toLowerCase();
   const samePerson = existing.filter((r) => sameName(r) || sameId(r));
@@ -637,7 +643,7 @@ async function addDiscount(tenantId, id, body) {
       person_type, person_name, person_id, discount_scope, basis, discount_part, vat_part, exempt_sale
     ) values (
       ${tenantId}, ${id}, 'discount', ${description}, ${calc.amount},
-      ${personType}, ${personName}, ${personId}, ${scope}, ${calc.basis}, ${calc.discount_part}, ${calc.vat_part}, ${calc.exempt_sale}
+      ${personType}, ${personName}, ${encryptSoft(personId)}, ${scope}, ${calc.basis}, ${calc.discount_part}, ${calc.vat_part}, ${calc.exempt_sale}
     )
   `;
   return done({ amount: calc.amount });

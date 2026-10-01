@@ -1,4 +1,5 @@
 import { sql } from '@vercel/postgres';
+import { decryptText } from './crypto.js';
 
 // Guest records (CRM): one profile per guest across stays.
 // Lives in _lib so it adds no serverless function (Vercel Hobby cap is 12).
@@ -179,7 +180,9 @@ export async function getGuest(tenantId, guestId) {
     order by b.check_in desc
     limit 500
   `;
-  return done({ guest: g.rows[0], bookings: stays.rows });
+  // ID numbers are stored encrypted; show them as plain text to the signed-in team.
+  const staysOut = stays.rows.map((s) => (s.guest_id_number ? { ...s, guest_id_number: decryptText(s.guest_id_number) } : s));
+  return done({ guest: g.rows[0], bookings: staysOut });
 }
 
 // Extra guest facts for a set of booking rows (Front Desk cards and the
@@ -223,7 +226,7 @@ export async function addGuestInfo(tenantId, rows) {
         guest_other_stays: mine.length,
         guest_earlier_stays: earlier.length,
         guest_last_id_type: withId ? withId.guest_id_type : null,
-        guest_last_id_number: withId ? withId.guest_id_number : null,
+        guest_last_id_number: withId ? decryptText(withId.guest_id_number) : null,
       };
     });
   } catch (err) {
