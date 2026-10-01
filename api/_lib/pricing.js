@@ -1,5 +1,6 @@
 import { sql } from '@vercel/postgres';
 import { getAccount } from './limits.js';
+import { loadRules, priceStay, ruleMinStay } from './rates.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -80,9 +81,6 @@ export async function computeQuote(input) {
   if (check_in < today) {
     return fail(400, 'Check-in date cannot be in the past');
   }
-  if (nights < minStay) {
-    return fail(400, `Minimum stay is ${minStay} night${minStay === 1 ? '' : 's'}`);
-  }
   if (inDay - dayNumber(today) > windowDays) {
     return fail(400, `Bookings can only be made up to ${windowDays} days ahead`);
   }
@@ -98,6 +96,14 @@ export async function computeQuote(input) {
   const capacity = unitResult.rows[0].capacity_guests
     ? Number(unitResult.rows[0].capacity_guests)
     : null;
+
+  // Price rules (weekend, seasons, holidays). The larger of the resort-wide
+  // minimum stay and the minimum set by the rule on the check-in night applies.
+  const rules = await loadRules(tenant_id, unit_type_id);
+  const neededStay = Math.max(minStay, ruleMinStay(rules, check_in));
+  if (nights < neededStay) {
+    return fail(400, `Minimum stay is ${neededStay} night${neededStay === 1 ? '' : 's'}`);
+  }
 
   const guestCount = Math.max(1, Math.floor(Number(guests)) || 1);
   if (capacity && guestCount > capacity) {
@@ -178,7 +184,8 @@ export async function computeQuote(input) {
     }
   }
 
-  const baseAmount = round2(baseRate * nights);
+  const priced = priceStay(baseRate, rules, check_in, nights);
+  const baseAmount = priced.total;
   addonsAmount = round2(addonsAmount);
   const preDiscountSubtotal = baseAmount + addonsAmount;
 
@@ -233,7 +240,9 @@ export async function computeQuote(input) {
     check_out,
     nights,
     guests: guestCount,
-    base_rate: baseRate,
+    // Average price per night (each night can have its own price now).
+    base_rate: round2(baseAmount / nights),
+    nightly: priced.nightly,
     base_amount: baseAmount,
     addons_amount: addonsAmount,
     discount_amount: discountAmount,

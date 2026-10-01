@@ -1,6 +1,7 @@
 import { sql } from '@vercel/postgres';
 import { setCors, text, isBookableStatus } from './_lib/helpers.js';
 import { getAccount, countBookingsThisMonth } from './_lib/limits.js';
+import { loadRulesByType, priceOverrides, minStayOverrides } from './_lib/rates.js';
 
 // Only PayMongo is built in. Any other channel is created by the tenant and stored
 // under a "custom_..." key (see settings.js), so there is nothing else to default.
@@ -196,6 +197,21 @@ export default async function handler(req, res) {
       unitRows = unitRows.filter((u) => typesWithRooms.has(String(u.id)));
 
       const windowDays = settings.booking_window_days ? Number(settings.booking_window_days) : 365;
+
+      // Price rules: send only the dates whose price (or minimum stay) differs
+      // from the normal one, so the widget can show the right price per date.
+      const rulesByType = await loadRulesByType(tenant.id);
+      const spanDays = Math.min(Math.max(windowDays, 1), 400);
+      const todayStr = todayIn(tenant.timezone);
+      unitRows = unitRows.map((u) => {
+        const rules = rulesByType[String(u.id)] || [];
+        return {
+          ...u,
+          price_overrides: priceOverrides(Number(u.base_rate), rules, todayStr, spanDays),
+          min_stay_overrides: minStayOverrides(rules, todayStr, spanDays),
+        };
+      });
+
       unavailable = await computeUnavailable(
         tenant.id,
         unitRows,

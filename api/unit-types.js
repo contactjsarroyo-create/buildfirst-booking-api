@@ -3,6 +3,7 @@ import { put } from '@vercel/blob';
 import { setCors, getAuth, can, staffCannot, num, text } from './_lib/helpers.js';
 import { getAccount, getUsage, planLimit, blocked, reserveStorage, releaseStorage } from './_lib/limits.js';
 import { recordFileOrRollback, removeFiles, isUuid } from './_lib/storage.js';
+import { loadRulesByType } from './_lib/rates.js';
 
 
 // Short room code from a room type's name: "Standard Room" -> SR, "Deluxe
@@ -60,7 +61,8 @@ export default async function handler(req, res) {
   }
 
   const rq = req.query && req.query.resource;
-  const resource = rq === 'rooms' ? 'rooms' : rq === 'photos' ? 'photos' : 'unit_types';
+  const resource =
+    rq === 'rooms' ? 'rooms' : rq === 'photos' ? 'photos' : rq === 'rules' ? 'rules' : 'unit_types';
 
   try {
     if (resource === 'rooms') {
@@ -68,6 +70,9 @@ export default async function handler(req, res) {
     }
     if (resource === 'photos') {
       return await handlePhotos(req, res, auth);
+    }
+    if (resource === 'rules') {
+      return await handleRules(req, res, auth);
     }
 
     if (req.method === 'GET') {
@@ -103,10 +108,18 @@ export default async function handler(req, res) {
         if (!photosByType[p.unit_type_id]) photosByType[p.unit_type_id] = [];
         photosByType[p.unit_type_id].push({ id: p.id, url: p.url });
       }
+      // Price rules (weekend, seasons, holidays) per room type.
+      let rulesByType = {};
+      try {
+        rulesByType = await loadRulesByType(auth.tenant_id);
+      } catch (e) {
+        console.error('price_rules read failed', e);
+      }
       const unit_types = typesResult.rows.map((t) => ({
         ...t,
         rooms: roomsByType[t.id] || [],
         photos: photosByType[t.id] || [],
+        price_rules: rulesByType[String(t.id)] || [],
       }));
       return res.status(200).json({ ok: true, unit_types });
     }
@@ -558,4 +571,112 @@ async function handlePhotos(req, res, auth) {
   }
 
   return res.status(405).json({ ok: false, error: 'Method not allowed' });
+}
+
+
+// Price rules, reached via /api/unit-types?resource=rules
+// POST adds a rule, PUT edits one (body has id), DELETE removes one (?id=).
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const MAX_RULES_PER_TYPE = 30;
+
+function readRule(b) {
+  const name = text(b.name);
+  if (!name) return { error: 'Give this price a name, for example Weekend or Christmas' };
+  if (name.length > 60) return { error: 'The name is too long (60 letters at most)' };
+
+  let days = [];
+  if (Array.isArray(b.days)) {
+    days = Array.from(new Set(b.days.map((d) => Number(d))));
+    if (days.some((d) => !Number.isInteger(d) || d < 0 || d > 6)) {
+      return { error: 'Pick days of the week only' };
+    }
+    days.sort((a, c) => a - c);
+  }
+  if (days.length === 7) days = [];
+
+  const start = text(b.start_date) || null;
+  const end = text(b.end_date) || null;
+  if ((start && !DATE_RE.test(start)) || (end && !DATE_RE.test(end))) {
+    return { error: 'Dates must look like 2026-12-20' };
+  }
+  const realDate = (d) => !d || new Date(d + 'T00:00:00Z').toISOString().slice(0, 10) === d;
+  if (!realDate(start) || !realDate(end)) return { error: 'That date does not exist' };
+  if (start && end && end < start) return { error: 'The end date must be on or after the start date' };
+
+  const kind = b.kind === 'percent' ? 'percent' : 'fixed';
+  const amount = num(b.amount);
+  if (amount === null) return { error: 'Enter the price or the percent' };
+  if (kind === 'fixed' && (amount < 0 || amount > 10000000)) {
+    return { error: 'Enter a price of 0 or more' };
+  }
+  if (kind === 'percent' && (amount < -90 || amount > 1000)) {
+    return { error: 'The percent must be between -90 and 1000' };
+  }
+  if (kind === 'percent' && amount === 0) return { error: 'A percent of 0 changes nothing' };
+
+  let minStay = null;
+  if (b.min_stay !== undefined && b.min_stay !== null && b.min_stay !== '') {
+    const m = Math.floor(Number(b.min_stay));
+    if (!(m >= 1 && m <= 60)) return { error: 'Minimum stay must be between 1 and 60 nights' };
+    minStay = m > 1 ? m : null;
+  }
+  return { name, days, start, end, kind, amount, minStay };
+}
+
+async function handleRules(req, res, auth) {
+  if (req.method === 'DELETE') {
+    const id = text(req.query && req.query.id);
+    if (!id || !isUuid(id)) return res.status(400).json({ ok: false, error: 'id is required' });
+    const r = await sql`
+      delete from price_rules where id = ${id} and tenant_id = ${auth.tenant_id} returning id
+    `;
+    if (r.rows.length === 0) return res.status(404).json({ ok: false, error: 'Not found' });
+    return res.status(200).json({ ok: true });
+  }
+
+  if (req.method !== 'POST' && req.method !== 'PUT') {
+    return res.status(405).json({ ok: false, error: 'Method not allowed' });
+  }
+
+  const b = req.body || {};
+  const rule = readRule(b);
+  if (rule.error) return res.status(400).json({ ok: false, error: rule.error });
+  const daysLiteral = '{' + rule.days.join(',') + '}';
+
+  if (req.method === 'POST') {
+    const unitTypeId = text(b.unit_type_id);
+    if (!unitTypeId || !isUuid(unitTypeId)) {
+      return res.status(400).json({ ok: false, error: 'Room type is required' });
+    }
+    const owns = await sql`
+      select id from unit_types where id = ${unitTypeId} and tenant_id = ${auth.tenant_id}
+    `;
+    if (owns.rows.length === 0) return res.status(404).json({ ok: false, error: 'Room type not found' });
+    const count = await sql`
+      select count(*)::int as n from price_rules
+      where unit_type_id = ${unitTypeId} and tenant_id = ${auth.tenant_id}
+    `;
+    if (count.rows[0].n >= MAX_RULES_PER_TYPE) {
+      return res.status(409).json({ ok: false, error: 'You can have up to ' + MAX_RULES_PER_TYPE + ' prices per room type' });
+    }
+    const r = await sql`
+      insert into price_rules (tenant_id, unit_type_id, name, days, start_date, end_date, kind, amount, min_stay)
+      values (${auth.tenant_id}, ${unitTypeId}, ${rule.name}, ${daysLiteral}::smallint[],
+              ${rule.start}::date, ${rule.end}::date, ${rule.kind}, ${rule.amount}, ${rule.minStay})
+      returning id
+    `;
+    return res.status(200).json({ ok: true, id: r.rows[0].id });
+  }
+
+  const id = text(b.id);
+  if (!id || !isUuid(id)) return res.status(400).json({ ok: false, error: 'id is required' });
+  const r = await sql`
+    update price_rules
+    set name = ${rule.name}, days = ${daysLiteral}::smallint[], start_date = ${rule.start}::date,
+        end_date = ${rule.end}::date, kind = ${rule.kind}, amount = ${rule.amount}, min_stay = ${rule.minStay}
+    where id = ${id} and tenant_id = ${auth.tenant_id}
+    returning id
+  `;
+  if (r.rows.length === 0) return res.status(404).json({ ok: false, error: 'Not found' });
+  return res.status(200).json({ ok: true });
 }

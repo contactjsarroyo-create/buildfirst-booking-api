@@ -19,6 +19,7 @@ export default async function handler(req, res) {
       nights: q.nights,
       guests: q.guests,
       base_rate: q.base_rate,
+      nightly: q.nightly,
       base_amount: q.base_amount,
       addons_amount: q.addons_amount,
       discount_amount: q.discount_amount,
