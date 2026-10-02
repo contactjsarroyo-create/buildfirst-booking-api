@@ -8,7 +8,7 @@
 //   APP_URL         the full URL of the Framer login page that email links
 //                   open, e.g.  https://yoursite.com/dashboard
 
-const DEFAULT_APP_URL = 'https://grounded-operations-212858.framer.app/dashboard';
+const DEFAULT_APP_URL = 'https://buildfirst.digital/dashboard';
 const SEND_TIMEOUT_MS = 8000;
 
 // Builds a link to the login page with query params, e.g. ?verify=TOKEN
