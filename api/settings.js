@@ -32,7 +32,7 @@ import { sanitizeEmailConfig, EMAIL_DEFAULTS, PLACEHOLDERS } from './_lib/emailc
 import { sendTestEmail } from './_lib/bookingemails.js';
 import { getMoneySettings, saveMoneySettings } from './_lib/money.js';
 import { getIcalState, icalAction, icalCron } from './_lib/ical.js';
-import { adminCall } from './_lib/admin.js';
+import { adminCall, clientSyncCron } from './_lib/admin.js';
 
 const HEX_RE = /^#[0-9a-fA-F]{6}$/;
 const FONT_WHITELIST = [
@@ -700,6 +700,16 @@ async function handler(req, res) {
       return await icalCron(req, res);
     } catch (err) {
       console.error('ical cron', err && err.message);
+      return res.status(500).json({ ok: false, error: 'Server error' });
+    }
+  }
+
+  // Daily copy of outside clients' bookings (Vercel cron). No login: it checks CRON_SECRET itself.
+  if (req.query && req.query.resource === 'client_sync_cron') {
+    try {
+      return await clientSyncCron(req, res);
+    } catch (err) {
+      console.error('client sync cron', err && err.message);
       return res.status(500).json({ ok: false, error: 'Server error' });
     }
   }

@@ -1,5 +1,8 @@
 import { sql } from '@vercel/postgres';
 import { resolveAccount, getUsage, PLAN_LIMITS } from './limits.js';
+import { listClientConfigs, publicConfig, syncClient, syncStatus, loadRows, buildAnalytics, clientSyncCron } from './clientsync.js';
+
+export { clientSyncCron };
 
 // ------------------------------------------------------------
 // Owner-of-Buildfirst admin tools. Reached via /api/settings?resource=admin
@@ -129,50 +132,42 @@ async function detail(id) {
   };
 }
 
-// Existing clients that run their own systems (Merbau, later Elmarie).
-// Vercel setting CLIENT_FEEDS (JSON list):
-// [{"key":"merbau","name":"Merbau Events & Villas","url":"https://.../api/client-stats",
-//   "token":"...","launch":"2026-03-15","baseline_monthly_bookings":6}]
-// launch and baseline_monthly_bookings are optional. The url and token are never sent to the browser.
-async function clientFeeds() {
-  let list = [];
-  try {
-    list = JSON.parse(process.env.CLIENT_FEEDS || '[]');
-    if (!Array.isArray(list)) list = [];
-  } catch (e) {
-    return { error: 'CLIENT_FEEDS is not valid JSON.', clients: [] };
-  }
-  const clients = await Promise.all(
-    list.map(async (c) => {
-      const base = {
-        key: String(c.key || c.name || ''),
-        name: String(c.name || c.key || 'Client'),
-        launch: c.launch ? String(c.launch) : null,
-        baseline_monthly_bookings: Number(c.baseline_monthly_bookings) > 0 ? Number(c.baseline_monthly_bookings) : null,
-      };
-      try {
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 8000);
-        const r = await fetch(String(c.url), { headers: { 'x-stats-token': String(c.token || '') }, signal: ctrl.signal });
-        clearTimeout(timer);
-        const j = await r.json().catch(() => ({}));
-        if (!r.ok || !j.ok) return { ...base, ok: false, error: 'Their system answered ' + r.status + '.' };
-        return { ...base, ok: true, totals: j.totals, months: j.months, top_rooms: j.top_rooms, undated_rows: j.undated_rows, note: j.note };
-      } catch (e) {
-        return { ...base, ok: false, error: 'Could not reach their system.' };
-      }
-    })
-  );
-  return { clients };
-}
-
 export async function adminCall(req, res, auth) {
   const who = await requireAdmin(res, auth);
   if (!who) return;
 
+  // Outside clients (Merbau, ...). List: names and sync status.
   if (req.method === 'GET' && req.query && req.query.view === 'clients') {
-    const out = await clientFeeds();
-    return res.status(200).json({ ok: true, ...out });
+    const clients = [];
+    for (const c of listClientConfigs()) {
+      let st = { last_sync: null, rows: 0, removed: 0 };
+      try { st = await syncStatus(c.key); } catch (e) { st.error = 'The client_bookings table is missing. Run the migration.'; }
+      clients.push({ ...publicConfig(c), ...st });
+    }
+    return res.status(200).json({ ok: true, clients });
+  }
+
+  // One client: sync if stale (or on request), then full analytics from OUR copy.
+  if (req.method === 'GET' && req.query && req.query.view === 'client') {
+    const cfg = listClientConfigs().find((c) => c.key === String(req.query.client || ''));
+    if (!cfg) return res.status(404).json({ ok: false, error: 'Client not found.' });
+    let sync = { ok: true };
+    try {
+      sync = await syncClient(cfg, req.query.refresh === '1');
+    } catch (e) {
+      console.error('client sync', e && e.message);
+      sync = { ok: false, error: 'Sync failed. Is the client_bookings table created?' };
+    }
+    let rows = [];
+    try {
+      rows = await loadRows(cfg.key);
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: 'The client_bookings table is missing. Run the migration.' });
+    }
+    const from = /^\d{4}-\d{2}$/.test(String(req.query.from || '')) ? String(req.query.from) : null;
+    const analytics = buildAnalytics(rows, { includeRemoved: req.query.include_removed !== '0', from });
+    const st = await syncStatus(cfg.key);
+    return res.status(200).json({ ok: true, client: publicConfig(cfg), sync: { ...sync, last_sync: st.last_sync }, analytics });
   }
 
   if (req.method === 'GET') {
