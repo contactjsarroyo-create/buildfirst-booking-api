@@ -32,6 +32,7 @@ import { sanitizeEmailConfig, EMAIL_DEFAULTS, PLACEHOLDERS } from './_lib/emailc
 import { sendTestEmail } from './_lib/bookingemails.js';
 import { getMoneySettings, saveMoneySettings } from './_lib/money.js';
 import { getIcalState, icalAction, icalCron } from './_lib/ical.js';
+import { adminCall } from './_lib/admin.js';
 
 const HEX_RE = /^#[0-9a-fA-F]{6}$/;
 const FONT_WHITELIST = [
@@ -707,6 +708,9 @@ async function handler(req, res) {
   if (!auth) return res.status(401).json({ ok: false, error: 'Unauthorized' });
 
   try {
+    if (req.query && req.query.resource === 'admin') {
+      return await adminCall(req, res, auth);
+    }
     if (req.query && req.query.resource === 'storage') {
       return await handleStorage(req, res, auth);
     }
