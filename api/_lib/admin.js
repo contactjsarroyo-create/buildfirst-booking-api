@@ -129,9 +129,51 @@ async function detail(id) {
   };
 }
 
+// Existing clients that run their own systems (Merbau, later Elmarie).
+// Vercel setting CLIENT_FEEDS (JSON list):
+// [{"key":"merbau","name":"Merbau Events & Villas","url":"https://.../api/client-stats",
+//   "token":"...","launch":"2026-03-15","baseline_monthly_bookings":6}]
+// launch and baseline_monthly_bookings are optional. The url and token are never sent to the browser.
+async function clientFeeds() {
+  let list = [];
+  try {
+    list = JSON.parse(process.env.CLIENT_FEEDS || '[]');
+    if (!Array.isArray(list)) list = [];
+  } catch (e) {
+    return { error: 'CLIENT_FEEDS is not valid JSON.', clients: [] };
+  }
+  const clients = await Promise.all(
+    list.map(async (c) => {
+      const base = {
+        key: String(c.key || c.name || ''),
+        name: String(c.name || c.key || 'Client'),
+        launch: c.launch ? String(c.launch) : null,
+        baseline_monthly_bookings: Number(c.baseline_monthly_bookings) > 0 ? Number(c.baseline_monthly_bookings) : null,
+      };
+      try {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 8000);
+        const r = await fetch(String(c.url), { headers: { 'x-stats-token': String(c.token || '') }, signal: ctrl.signal });
+        clearTimeout(timer);
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || !j.ok) return { ...base, ok: false, error: 'Their system answered ' + r.status + '.' };
+        return { ...base, ok: true, totals: j.totals, months: j.months, top_rooms: j.top_rooms, undated_rows: j.undated_rows, note: j.note };
+      } catch (e) {
+        return { ...base, ok: false, error: 'Could not reach their system.' };
+      }
+    })
+  );
+  return { clients };
+}
+
 export async function adminCall(req, res, auth) {
   const who = await requireAdmin(res, auth);
   if (!who) return;
+
+  if (req.method === 'GET' && req.query && req.query.view === 'clients') {
+    const out = await clientFeeds();
+    return res.status(200).json({ ok: true, ...out });
+  }
 
   if (req.method === 'GET') {
     const id = req.query && req.query.tenant_id;
